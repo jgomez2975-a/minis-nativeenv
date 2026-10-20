@@ -130,30 +130,6 @@ actor ISHExecutionCoordinator {
             throw ISHCoordinatorError.kernelNotBooted
         }
 
-        // [native-runtime-graft] Prefer the real executor when this build is
-        // platform-signed and the shell helpers shipped. Everything below this
-        // block is upstream iSH behaviour, untouched; a device that cannot exec
-        // natively throws here and pays only one availability check.
-        if await NativeShellBackend.shared.isAvailable {
-            do {
-                let native = try await NativeShellBackend.shared.execute(
-                    sessionId: sessionId,
-                    command: command,
-                    timeout: timeout,
-                    lineCallback: lineCallback,
-                    pidCallback: { pidCallback(pid_t($0)) }
-                )
-                return native.ishResult
-            } catch let err as NativeShellError {
-                if case .timedOut(let partial, _, _) = err {
-                    return ISHCommandResult(output: partial, exitCode: 124)
-                }
-                logger.warning("native backend failed, falling back to iSH: \(err.localizedDescription)")
-            } catch {
-                logger.warning("native backend failed, falling back to iSH: \(error.localizedDescription)")
-            }
-        }
-
         // Register ourselves in the in-flight table purely for
         // stop/preempt visibility — we do NOT wait for prior entries.
         let myId = UUID()
