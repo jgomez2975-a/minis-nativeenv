@@ -267,20 +267,35 @@ jobs:
 
       - name: Install ldid
         # The .tipa is only installable if the main binary carries
-        # platform-application AND a blob CoreTrust accepts. `codesign -s -`
-        # embeds entitlements but produces no CMS, which some iOS builds reject
-        # at launch; ldid is what TrollStore-era packages are made with.
+        # platform-application AND a blob CoreTrust accepts.
+        #
+        # Homebrew's `ldid` is 2.1.5 — saurik's original, old enough that
+        # `codesign` reports "code object is not signed at all" for what it
+        # writes on a current iOS binary. ProcursusTeam/ldid is the fork the
+        # TrollStore tooling actually uses, so that is the one that gets built,
+        # and it is self-tested here rather than discovered at packaging time.
         run: |
-          set -eu
-          if brew install ldid 2>/dev/null && command -v ldid; then
-            ldid --version || true
-            exit 0
+          set -euo pipefail
+          brew install libplist make || true
+          git clone --depth 1 https://github.com/ProcursusTeam/ldid /tmp/ldid-src
+          make -C /tmp/ldid-src -j"$(sysctl -n hw.ncpu)"
+          install -m 0755 /tmp/ldid-src/ldid /usr/local/bin/ldid
+          which -a ldid
+          /usr/local/bin/ldid 2>&1 | head -3 || true
+
+          # Self-test: sign a throwaway copy of a real Mach-O and read the
+          # entitlements back. If this fails, packaging 20 minutes later cannot
+          # succeed and the error there is much harder to read.
+          cp /bin/echo /tmp/ldid-selftest
+          /usr/local/bin/ldid -Sentitlements/Minis-TrollStore.entitlements /tmp/ldid-selftest
+          if codesign -d --entitlements :- /tmp/ldid-selftest 2>&1 | grep -q 'platform-application'; then
+            echo "ldid self-test: entitlements readable"
+          else
+            echo "::error::ldid wrote a signature codesign cannot read; the tipa would not install"
+            codesign -d --entitlements :- /tmp/ldid-selftest 2>&1 | head -10 || true
+            exit 1
           fi
-          echo "homebrew formula unavailable, building from source"
-          git clone --depth 1 https://github.com/ProcursusTeam/ldid /tmp/ldid
-          make -C /tmp/ldid -j"$(sysctl -n hw.ncpu)" CXXFLAGS="-O2 -I/tmp/ldid"
-          cp /tmp/ldid/ldid /usr/local/bin/ldid
-          ldid --version || echo "::warning::ldid built but --version unsupported"
+          rm -f /tmp/ldid-selftest
 
       - name: Disk headroom
         run: df -h / /Users/runner

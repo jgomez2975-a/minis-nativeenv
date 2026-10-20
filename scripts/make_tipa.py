@@ -121,7 +121,15 @@ def thin_binaries(app: Path) -> None:
 
 class Signer:
     def __init__(self) -> None:
-        self.ldid = which("ldid")
+        # Prefer the Procursus build the CI installs. Homebrew also ships an
+        # `ldid` (2.1.5, saurik's original) whose output current `codesign`
+        # reports as "code object is not signed at all", so a bare `which ldid`
+        # can silently pick the wrong one.
+        self.ldid = None
+        for candidate in ("/usr/local/bin/ldid", which("ldid")):
+            if candidate and Path(candidate).exists():
+                self.ldid = candidate
+                break
         self.codesign = which("codesign")
         if not self.ldid and not self.codesign:
             raise SystemExit("error: neither ldid nor codesign available")
@@ -217,8 +225,21 @@ def make_zip(app: Path, out: Path) -> None:
         shutil.copytree(app, target, symlinks=True, copy_function=shutil.copy2)
 
         if which("zip"):
-            # -y preserves symlinks, -r recursive, -q quiet
-            run(["zip", "-qry", str(out.resolve()), "Payload"], check=True)
+            # -y preserves symlinks, -r recursive, -q quiet.
+            #
+            # cwd matters: the archive members must be `Payload/...` at the root
+            # of the zip, and `zip` resolves its argument against the process
+            # working directory, not against anything it is told separately.
+            # Without cwd the command found no Payload directory and exited 12
+            # ("nothing to do") after the whole build had succeeded.
+            result = subprocess.run(
+                ["zip", "-qry", str(out.resolve()), "Payload"],
+                cwd=str(tmp), capture_output=True, text=True,
+                encoding="utf-8", errors="replace")
+            if result.returncode != 0:
+                raise SystemExit(
+                    f"error: zip failed ({result.returncode})\n"
+                    f"{result.stdout}\n{result.stderr}")
         else:
             with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
                 for root, _dirs, files in os.walk(payload):
