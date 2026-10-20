@@ -58,7 +58,7 @@ jobs:
         # dependency build.
         run: |
           set -eu
-          python3 -m pip install --quiet --user pyyaml tree_sitter tree_sitter_swift
+          python3 -m pip install --quiet --user pyyaml tree_sitter tree_sitter_swift tree_sitter_c
           python3 scripts/preflight.py --repo .
           echo "::notice::preflight passed"
 

@@ -130,3 +130,52 @@ iSH(meson + clang)、FFmpeg(Metal toolchain)、rclone(Go 静态 xcframework)、
 **代价**:这个包只能 TrollStore 装,或者装成越狱 deb。
 App Store 装法、AltStore/SideStore 免费证书都装不上 —— `platform-application` 是平台专属权限,
 启动会被内核拒。这是加环境的必付代价,绕不过。
+
+---
+
+## 6. 验证状态:哪些是证实过的,哪些还没有
+
+没有 macOS 就意味着**没有编译过**。除此之外能验的,都验了。
+
+已经证实的:
+
+| 项 | 方法 | 结果 |
+|---|---|---|
+| CoreToolsRuntime 清单项 | 下载 + SHA-256 对照 manifest | `80f9fd75…` **完全一致** |
+| 运行时包内部结构 | 解包 9.9 MB 真实 tar.gz | `bin/` + `manifest.json` 在根,17 个成员,`required_paths` 全部存在 |
+| tar 成员类型 | python tarfile 审计 | 目录 1 / 普通文件 7 / 符号链接 9,**无 pax、无 GNU 长名、无 `..`、无绝对路径** |
+| 符号链接语义 | `tar -tvzf` | `git-remote-https -> git-remote-http` 等全是**同目录相对路径**,我的读写实现按原名创建,成立 |
+| gzip 状态机 | 用真实 9.9 MB 包按 64 KB 分块模拟 | 152 块,**输出与一次性解压逐字节相同**(23,920,640 B) |
+| Swift 语法(5 个文件,2900 行) | tree-sitter-swift 解析 | **0 错误** |
+| C 语法(解压 shim) | tree-sitter-c 解析 | **0 错误** |
+| 补丁脚本 | 对真实 `project.pbxproj` 实跑 | 3 处编辑全部落位,target 归属正确,1281 个引用 id 全部有定义,括号 1368/1368 平衡 |
+| entitlements | plistlib 解析 | 20 键合法,平台权限齐 |
+| 打包脚本 | 造 stub `.app` 实跑 `--skip-signing` | 产出 `Payload/Minis.app/…` 结构正确,`_CodeSignature` 已清,嵌套 bundle 层级对 |
+| MT-Agent 1.0.5 vs 1.0.6 | 三个 helper 二进制逐字节比对 | `bash.real`/`ca-filetool`/`codex-sign` **完全相同**,所以钉 1.0.5 不吃亏 |
+
+这一轮里**改掉的真 bug**(不是风格问题):
+
+- **gzip 解压状态机**:原来那版把"输入缓冲用完"当成"流被截断",任何超过 64 KB 的包都会解失败 ——
+  也就是所有真实运行时包。现在 `RA_NEED_INPUT` 是独立的非错误返回。
+- **`LineCollector` 丢输出**:只保留最后一个未换行的片段,`result.output` 对任何忽略逐行回调的调用方
+  (probe、签名器)都是空字符串。现在整条流单独累积。
+- **可用性探测的数据竞争**:`lazy var` 被主线程、安装器 actor、后台队列三方同时首次访问。改成锁保护。
+- **挂载路径走 `URL(string:)`**:任何含空格的路径直接返回 nil,挂载被静默丢弃。改 `fileURLWithPath`。
+- **`shellEnvironment()` 读 nil 清单**:首次拉取之前调用会得到一条没有任何运行时的 PATH,
+  表现像"工具链装坏了"。现在回退读磁盘缓存。
+- **`lipo -info` 判断写反**:原来那个 `arm64e` 条件会跳过**本该**瘦身的 fat 二进制。
+- **`PRODUCT_BUNDLE_IDENTIFIER` 覆盖**:只改主 app 的 id 会让四个内嵌扩展指向不存在的主 app,embed 阶段校验失败。
+  已移除。
+
+还没有验证的(必须靠真机/真机编译):
+
+- **能不能编译通过**。语法干净 ≠ 类型检查通过。`AnyActor`、`posix_spawn` 的指针参数、
+  Swift 6 的严格并发 —— 这些只有 Xcode 能判。
+- **`posix_spawn` 在平台签名下的实际行为**。理论上 `platform-application` 放开 `process-exec`,
+  理论上 ad-hoc 签名的子二进制可执行。要真机确认。
+- **`codex-sign` 的命令行契约**。我从字符串里读出 `--adhoc-only` / `--entitlements`,
+  没跑过。跑失败会走"跳过重签名"分支,不会中断安装。
+- **TheosRuntime 解包 980 MB 在手机上的耗时和内存**。这是最重的一步。
+- **runner 上 iOS 26.2 SDK 在不在**。workflow 里做了自动降级(读到低于 26.2 的 SDK 就压低部署目标),
+  但降级之后能不能编过没验过。
+

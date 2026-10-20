@@ -263,6 +263,21 @@ def check_pbxproj(repo: Path) -> None:
 # Swift
 # ---------------------------------------------------------------------------
 
+def collect_errors(parser, text: bytes) -> list[int]:
+    """Line numbers of every ERROR / missing node in a tree-sitter parse."""
+    tree = parser.parse(text)
+    lines: list[int] = []
+
+    def walk(node) -> None:
+        if node.type == "ERROR" or node.is_missing:
+            lines.append(node.start_point[0] + 1)
+        for child in node.children:
+            walk(child)
+
+    walk(tree.root_node)
+    return lines
+
+
 def check_swift(repo: Path) -> None:
     print("\n[6] swift syntax")
     sources = sorted((repo / "src/ios/RuntimeHost").glob("*.swift"))
@@ -288,30 +303,44 @@ def check_swift(repo: Path) -> None:
 
     for src in sources:
         text = src.read_bytes()
-        tree = parser.parse(text)
-        root = tree.root_node
-        errors = []
-
-        def walk(node) -> None:
-            if node.type == "ERROR" or node.is_missing:
-                line = node.start_point[0] + 1
-                snippet = text.split(b"\n")[line - 1][:100].decode("utf-8", "replace")
-                errors.append(f"L{line}: {node.type} :: {snippet.strip()}")
-            for child in node.children:
-                walk(child)
-
-        walk(root)
+        errors = collect_errors(parser, text)
         if errors:
-            fail(f"{src.name}: {len(errors)} syntax error(s)")
-            for e in errors[:5]:
-                print("        " + e)
+            fail(f"{src.name}: {len(errors)} syntax error(s) at lines {errors[:5]}")
+            for line in errors[:3]:
+                snippet = text.split(b"\n")[line - 1][:100].decode("utf-8", "replace")
+                print(f"        L{line}: {snippet.strip()}")
         else:
             ok(f"{src.name} ({len(text)} bytes)")
 
-    # The C shim gets the same treatment via the C++ grammar if present.
-    for cfile in sorted((repo / "src/ios/RuntimeHost").glob("*.[ch]")):
-        if cfile.exists():
-            ok(f"{cfile.name} present ({cfile.stat().st_size} bytes)")
+    # The C shim gets its own pass. tree-sitter's C grammar cannot model
+    # `extern "C" {`, so the guards are stripped before parsing — otherwise
+    # every header using the standard idiom reports a phantom error.
+    try:
+        import tree_sitter_c
+        clang = tree_sitter.Language(tree_sitter_c.language())
+        cparser = tree_sitter.Parser(clang)
+    except ImportError:
+        warn("tree_sitter_c unavailable, skipping C parse")
+        return
+
+    for cfile in sorted((repo / "src/ios/RuntimeHost").glob("*.c")):
+        text = cfile.read_bytes()
+        errors = collect_errors(cparser, text)
+        if errors:
+            fail(f"{cfile.name}: {len(errors)} syntax error(s) at {errors[:5]}")
+        else:
+            ok(f"{cfile.name} ({len(text)} bytes)")
+
+    for hfile in sorted((repo / "src/ios/RuntimeHost").glob("*.h")):
+        text = hfile.read_bytes()
+        neutralised = (text
+                       .replace(b'#ifdef __cplusplus\n}\n#endif', b'')
+                       .replace(b'#ifdef __cplusplus\nextern "C" {\n#endif', b''))
+        errors = collect_errors(cparser, neutralised)
+        if errors:
+            fail(f"{hfile.name}: {len(errors)} syntax error(s) at {errors[:5]}")
+        else:
+            ok(f"{hfile.name} ({len(text)} bytes)")
 
 
 # ---------------------------------------------------------------------------
