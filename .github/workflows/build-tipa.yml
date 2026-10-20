@@ -52,13 +52,28 @@ jobs:
             fi
           done
 
+      - name: Python tooling
+        # A venv, not `pip install --user`. macOS runner images ship a
+        # Homebrew-managed python3 that refuses system installs under PEP 668
+        # ("externally-managed-environment"), so the first CI run died here
+        # before preflight ever executed. venv also keeps meson off the
+        # Homebrew prefix, which is what PEP 668 is protecting.
+        run: |
+          set -eu
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --quiet --upgrade pip
+          .venv/bin/python -m pip install --quiet \
+            pyyaml tree_sitter tree_sitter_swift tree_sitter_c meson
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          .venv/bin/python -c "import yaml, tree_sitter, tree_sitter_swift, tree_sitter_c; print('python tooling ready')"
+          .venv/bin/meson --version
+
       - name: Preflight
         # Everything checkable without Xcode, in ~20 s. Without this the first
         # Swift syntax error or plist typo surfaces 35 minutes into the native
         # dependency build.
         run: |
           set -eu
-          python3 -m pip install --quiet --user pyyaml tree_sitter tree_sitter_swift tree_sitter_c
           python3 scripts/preflight.py --repo .
           echo "::notice::preflight passed"
 
@@ -178,11 +193,12 @@ jobs:
                 src/android/app/provider-customization.properties || true
 
       - name: Install build dependencies
+        # meson arrives from the venv, not pip. Everything here is a native
+        # build dependency the deps/ scripts call directly.
         run: |
           set -eu
           brew install ninja llvm libarchive pkg-config go make || true
-          python3 -m pip install --user meson
-          echo "$HOME/Library/Python/$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')/bin" >> $GITHUB_PATH
+          command -v meson && meson --version
 
       - name: Install ldid
         # The .tipa is only installable if the main binary carries
