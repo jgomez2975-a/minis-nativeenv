@@ -116,17 +116,21 @@ actor NativeShellBackend {
         }
 
         for (logical, host) in hostPaths {
-            guard let hostURL = URL(string: host, relativeTo: nil) else { continue }
-            let linkParent = useSystemRoot
-                ? minisRoot.appendingPathComponent((logical as NSString).deletingLastPathComponent)
-                : root.appendingPathComponent("mnt/" + (logical as NSString).deletingLastPathComponent)
+            // host is a filesystem path, not a URL string: URL(string:) returns
+            // nil for any path containing a space, and silently dropping the
+            // mount would be worse than failing.
+            guard logical.hasPrefix("/") else { continue }
+            let hostPath = host.hasPrefix("file://")
+                ? (URL(string: host)?.path ?? String(host.dropFirst(7)))
+                : host
             let link = useSystemRoot
                 ? URL(fileURLWithPath: logical)
-                : root.appendingPathComponent("mnt/" + logical)
+                : root.appendingPathComponent("mnt" + logical)
+            let parent = link.deletingLastPathComponent()
 
-            try? fm.createDirectory(at: linkParent, withIntermediateDirectories: true)
+            try? fm.createDirectory(at: parent, withIntermediateDirectories: true)
             try? fm.removeItem(at: link)
-            try? fm.createSymbolicLink(at: link, withDestinationPath: hostURL.path)
+            try? fm.createSymbolicLink(atPath: link.path, withDestinationPath: hostPath)
         }
 
         preparedSessions.insert(sessionId)

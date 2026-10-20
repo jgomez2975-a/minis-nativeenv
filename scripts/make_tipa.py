@@ -87,24 +87,32 @@ def thin_binaries(app: Path) -> None:
         return
 
     binaries = [app / app.stem]
-    binaries += [p for p in app.glob("Frameworks/*.framework/*") if p.is_file() and not p.name.endswith(".plist")]
-    binaries += [p for p in app.glob("PlugIns/*.appex/*") if p.is_file() and not p.name.endswith(".plist")]
+    binaries += [p for p in app.glob("Frameworks/*.framework/*")
+                 if p.is_file() and not p.name.endswith(".plist")]
+    binaries += [p for p in app.glob("PlugIns/*.appex/*")
+                 if p.is_file() and not p.name.endswith(".plist")]
     binaries += [p for p in app.glob("Frameworks/*.dylib")]
 
     for binary in binaries:
         if not binary.is_file():
             continue
-        archs = run([lipo, "-info", str(binary)], check=False).stdout
-        if "arm64" not in archs:
+        info = run([lipo, "-info", str(binary)], check=False).stdout
+        # `lipo -info` prints "Non-fat file: … is architecture: arm64" for a thin
+        # binary and a space-separated architecture list for a fat one. Only a
+        # fat file with an arm64 slice needs work; anything else is left alone.
+        if "Non-fat file" in info or "arm64" not in info:
             continue
-        if "arm64e" in archs and archs.count("arm64") > 1:
-            continue  # already thin
-        tmp = binary.with_suffix(binary.suffix + ".thin")
+        architectures = info.rsplit("are:", 1)[-1].split() if "are:" in info else []
+        if len(architectures) <= 1:
+            continue
+        tmp = binary.with_name(binary.name + ".thin")
         result = run([lipo, str(binary), "-thin", "arm64", "-output", str(tmp)], check=False)
         if result.returncode == 0 and tmp.exists():
             tmp.chmod(binary.stat().st_mode)
             tmp.replace(binary)
             print(f"  thinned {binary.relative_to(app)}")
+        else:
+            print(f"  WARNING: could not thin {binary.relative_to(app)}: {result.stderr.strip()[:160]}")
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +235,9 @@ def main() -> int:
     ap.add_argument("--app", required=True, type=Path)
     ap.add_argument("--entitlements", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--skip-signing", action="store_true",
+                    help="package only; used to validate the zip/cleanup path "
+                         "on a host without ldid/codesign")
     args = ap.parse_args()
 
     app = args.app.resolve()
@@ -240,18 +251,34 @@ def main() -> int:
     print("[2/6] thinning to arm64")
     thin_binaries(app)
 
-    print("[3/6] signing nested code")
-    signer = Signer()
-    print(f"  signer: {'ldid' if signer.ldid else 'codesign (fallback)'}")
+    if args.skip_signing:
+        print("[3/6][4/6][5/6] signing/verify skipped (--skip-signing)")
+    else:
+        print("[3/6] signing nested code")
+        signer = Signer()
+        print(f"  signer: {'ldid' if signer.ldid else 'codesign (fallback)'}")
 
-    print("[4/6] signing app with entitlements")
-    sign_bundle(app, args.entitlements.resolve(), signer)
+        print("[4/6] signing app with entitlements")
+        sign_bundle(app, args.entitlements.resolve(), signer)
 
-    print("[5/6] verifying")
-    verify(app, args.entitlements.resolve())
+        print("[5/6] verifying")
+        verify(app, args.entitlements.resolve())
 
     print("[6/6] packaging")
     make_zip(app, args.out.resolve())
+
+    # Prove the archive has the shape TrollStore expects before handing it back.
+    with zipfile.ZipFile(args.out) as zf:
+        names = zf.namelist()
+    top = {n.split("/")[0] for n in names}
+    if top != {"Payload"}:
+        print(f"  ERROR: unexpected top-level entries: {sorted(top)}", file=sys.stderr)
+        return 1
+    info_plists = [n for n in names if n.endswith("/Info.plist") and n.count("/") == 2]
+    if not info_plists:
+        print("  ERROR: no Payload/<X>.app/Info.plist in archive", file=sys.stderr)
+        return 1
+    print(f"  structure OK: {len(names)} entries, app = {info_plists[0].split('/')[1]}")
 
     print("done")
     return 0

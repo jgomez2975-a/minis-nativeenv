@@ -269,22 +269,30 @@ actor RuntimeInstaller {
     /// helper), then each runtime's declared `path_entries`, then persistent
     /// entries (npm global prefix). A model that types `rg` or `git` gets the
     /// runtime copy, never a system one — iOS has none anyway.
+    ///
+    /// Synchronous by design: the probe and the signer both need this, and both
+    /// run inside blocking work. If the manifest has not been fetched yet it is
+    /// read from disk here rather than left nil, because a nil manifest would
+    /// silently produce a PATH with no runtimes on it — a false "toolchain
+    /// missing" that looks like a broken install.
     func shellEnvironment() -> [String: String] {
+        if manifest == nil { loadManifestFromCache() }
+
         var env: [String: String] = [:]
 
         var pathComponents: [String] = [paths.binDir.path]
+        let states = installedStates()
 
-        if let states = Optional(installedStates()) {
-            let m = manifest
+        if let m = manifest {
             for state in states where state.lastProbeOK {
-                guard let spec = m?.runtimes[state.key], let install = spec.install else { continue }
+                guard let spec = m.runtimes[state.key], let install = spec.install else { continue }
                 let root = URL(fileURLWithPath: state.installedRoot)
                 for entry in install.pathEntries {
                     pathComponents.append(root.appendingPathComponent(entry).path)
                 }
             }
             for state in states where state.lastProbeOK {
-                guard let spec = m?.runtimes[state.key],
+                guard let spec = m.runtimes[state.key],
                       let persistent = spec.install?.persistentPathEntries else { continue }
                 for entry in persistent {
                     pathComponents.append(expand(entry, root: URL(fileURLWithPath: state.installedRoot)).path)
@@ -310,7 +318,7 @@ actor RuntimeInstaller {
         env["DEVELOPER_DIR"] = paths.root.path
 
         if let m = manifest {
-            for state in installedStates() where state.lastProbeOK {
+            for state in states where state.lastProbeOK {
                 guard let spec = m.runtimes[state.key], let vars = spec.install?.environment else { continue }
                 let root = URL(fileURLWithPath: state.installedRoot)
                 for (k, v) in vars {
@@ -320,6 +328,15 @@ actor RuntimeInstaller {
         }
 
         return env
+    }
+
+    /// Synchronous manifest read for the paths that cannot await.
+    private func loadManifestFromCache() {
+        let cache = paths.root.appendingPathComponent("manifest.json")
+        if let data = try? Data(contentsOf: cache),
+           let parsed = try? JSONDecoder().decode(RuntimeManifest.self, from: data) {
+            manifest = parsed
+        }
     }
 
     /// `${RUNTIME_ROOT}` and `${RUNTIME_ROOT}/sub` expansion, as used by the

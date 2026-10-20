@@ -75,7 +75,18 @@ final class NativeShellExecutor {
 
     // MARK: - Capability probe
 
-    /// Set once, on first use.
+    /// Result of the one-time exec probe, or nil before the first call.
+    ///
+    /// Deliberately not `lazy var`: the singleton is reached from the main
+    /// actor, from the installer actor and from background dispatch queues, and
+    /// a lazy stored property initialised from three threads is a data race
+    /// that Swift will not catch. A lock around a cached optional is duller and
+    /// correct.
+    private static let availabilityLock = NSLock()
+    private static var cachedAvailability: Bool?
+    private static var cachedProbeErrno: Int32 = 0
+
+    /// True when this process can exec a real arm64 image.
     ///
     /// This is a real exec, not an entitlement lookup: the sandbox's decision to
     /// allow `process-exec` is the thing that matters, and the only way to know
@@ -84,24 +95,40 @@ final class NativeShellExecutor {
     /// whose availability differs per OS build. Spawning `bash -c "exit 0"`
     /// answers the actual question in ~20 ms and returns a concrete errno when
     /// the answer is no.
-    private(set) lazy var isNativeExecAvailable: Bool = Self.probeNativeExec()
+    var isNativeExecAvailable: Bool {
+        Self.availabilityLock.lock()
+        defer { Self.availabilityLock.unlock() }
+        if let cached = Self.cachedAvailability { return cached }
+        let (available, _) = Self.probeNativeExec()
+        Self.cachedAvailability = available
+        return available
+    }
 
-    /// Last errno seen by the probe, for the diagnostics panel.
-    private(set) static var lastProbeErrno: Int32 = 0
+    /// Errno from the last probe, for the diagnostics panel. 0 means the probe
+    /// never ran or succeeded.
+    var probeErrno: Int32 {
+        Self.availabilityLock.lock()
+        defer { Self.availabilityLock.unlock() }
+        if Self.cachedAvailability == nil { _ = isNativeExecAvailable }
+        return Self.cachedProbeErrno
+    }
 
-    private static func probeNativeExec() -> Bool {
+    private static func probeNativeExec() -> (Bool, Int32) {
         let candidates = ["Helpers/bash", "Helpers/bash.real"]
         guard let bash = candidates
             .map({ Bundle.main.bundleURL.appendingPathComponent($0) })
             .first(where: { FileManager.default.isExecutableFile(atPath: $0.path) })
         else {
-            lastProbeErrno = ENOENT
-            return false
+            cachedProbeErrno = ENOENT
+            return (false, ENOENT)
         }
 
         var pid: pid_t = 0
         let argv: [String] = [bash.path, "-c", "exit 0"]
-        guard let argvC = cStringArray(argv) else { return false }
+        guard let argvC = cStringArray(argv) else {
+            cachedProbeErrno = ENOMEM
+            return (false, ENOMEM)
+        }
         defer { freeCStringArray(argvC, count: argv.count) }
 
         var attr: posix_spawnattr_t?
@@ -109,14 +136,14 @@ final class NativeShellExecutor {
         defer { posix_spawnattr_destroy(&attr) }
 
         let rc = posix_spawn(&pid, bash.path, nil, &attr, argvC, environ)
-        lastProbeErrno = rc
+        cachedProbeErrno = rc
         guard rc == 0 else {
             log.error("native exec probe refused: \(String(cString: strerror(rc))) (\(rc))")
-            return false
+            return (false, rc)
         }
         var status: Int32 = 0
         _ = waitpid(pid, &status, 0)
-        return true
+        return (true, 0)
     }
 
     // MARK: - State
@@ -413,12 +440,16 @@ final class NativeShellExecutor {
 /// Turns raw chunks into lines, preserving order per stream and flushing a
 /// trailing partial line at EOF. `\r\n` is collapsed so progress bars from
 /// npm/git do not double-space the transcript.
+///
+/// It also keeps the complete stream, not just the last line: callers that
+/// ignore the per-line callback (the installer's probe, the signer) still need
+/// `result.output` to contain everything the child printed.
 private final class LineCollector {
     private let lock = NSLock()
-    private var outBuf = Data()
+    private var outBuf = Data()      // not yet newline-terminated
     private var errBuf = Data()
-    private var outDone = ""
-    private var errDone = ""
+    private var allOut = Data()      // everything, for .output
+    private var allErr = Data()
     private let onLine: ((String, Bool) -> Void)?
 
     init(onLine: ((String, Bool) -> Void)?) { self.onLine = onLine }
@@ -426,7 +457,13 @@ private final class LineCollector {
     func append(_ ptr: UnsafePointer<UInt8>, count: Int, isStdErr: Bool) {
         let chunk = Data(bytes: ptr, count: count)
         lock.lock()
-        if isStdErr { errBuf.append(chunk) } else { outBuf.append(chunk) }
+        if isStdErr {
+            errBuf.append(chunk)
+            allErr.append(chunk)
+        } else {
+            outBuf.append(chunk)
+            allOut.append(chunk)
+        }
         let lines = extract(isStdErr: isStdErr)
         lock.unlock()
         for line in lines { onLine?(line, isStdErr) }
@@ -463,11 +500,15 @@ private final class LineCollector {
 
     var stdout: String {
         lock.lock(); defer { lock.unlock() }
-        return outDone + (String(data: outBuf, encoding: .utf8) ?? "")
+        return String(data: allOut, encoding: .utf8)
+            ?? String(data: allOut, encoding: .isoLatin1)
+            ?? ""
     }
 
     var stderr: String {
         lock.lock(); defer { lock.unlock() }
-        return errDone + (String(data: errBuf, encoding: .utf8) ?? "")
+        return String(data: allErr, encoding: .utf8)
+            ?? String(data: allErr, encoding: .isoLatin1)
+            ?? ""
     }
 }
