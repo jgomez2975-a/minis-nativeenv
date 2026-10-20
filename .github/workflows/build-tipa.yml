@@ -231,7 +231,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/install
-          for key in core_tools python; do
+          # theos and ollvm are included on purpose: they are the two
+          # runtimes that turn the shell into a compiler (make, ldid and
+          # dpkg-deb from Theos; clang from OLLVM), so "it can build on
+          # device" is only a claim worth making if their archives
+          # download, checksum and extract for real.
+          for key in core_tools python theos ollvm; do
             echo "=== $key"
             /tmp/verify-host fetch /tmp/docs/manifest.json /tmp/docs /tmp/install "$key"
             rm -rf /tmp/install/root || true

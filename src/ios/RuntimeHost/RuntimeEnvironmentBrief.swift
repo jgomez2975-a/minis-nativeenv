@@ -79,10 +79,19 @@ enum RuntimeEnvironmentBrief {
         let summary = installedSummary.trimmingCharacters(in: .whitespacesAndNewlines)
         if !summary.isEmpty {
             text += "\n\nInstalled toolchains (already on PATH):\n" + summary
+
+            // OLLVM declares an empty path_entries list: clang is installed but
+            // deliberately kept off PATH, so a model that types `clang` gets
+            // command-not-found while the compiler sits right there.
+            if summary.contains("OLLVM") {
+                text += "\n\nThe OLLVM compiler is not on PATH by design. Use "
+                    + "$CA_TOOL_OLLVM_CLANG, and $CA_TOOL_OLLVM_RESOURCE_DIR for its "
+                    + "headers. Plain `clang` will not resolve."
+            }
         } else if nativeExecAvailable {
             text += "\n\nNo toolchain is installed yet — only bash and its builtins are "
-                + "available. Ask the user to install them from Settings › Agent Runtime › "
-                + "开发能力."
+                + "available. Ask the user to install them from Settings, Agent Runtime, "
+                + "Dev Capabilities."
         }
 
         return text
