@@ -79,9 +79,21 @@ final class NativeShellExecutor {
 
     /// The bash that ships in the bundle, or nil.
     static var bundledBash: String? {
-        for candidate in ["Helpers/bash", "Helpers/bash.real"] {
+        // `bash.real` first, and the order is not cosmetic.
+        //
+        // `Helpers/bash` is a symlink to `ca-filetool`, which is a multicall
+        // binary dispatching on argv[0] — and `bash` is not one of its cases
+        // (the shell itself is a separate 811 KB binary, `bash.real`). Spawning
+        // the symlink runs ca-filetool under the name "bash", which fails with
+        // ENOEXEC or a usage error, and the old code reported that failure as a
+        // missing entitlement. `isExecutableFile` follows the symlink and says
+        // yes, so the wrong candidate always won.
+        for candidate in ["Helpers/bash.real", "Helpers/bash"] {
             let url = Bundle.main.bundleURL.appendingPathComponent(candidate)
-            if FileManager.default.isExecutableFile(atPath: url.path) { return url.path }
+            if FileManager.default.isExecutableFile(atPath: url.path) {
+                // Resolve the link so the error message names the real image.
+                return url.resolvingSymlinksInPath().path
+            }
         }
         return nil
     }
@@ -189,8 +201,16 @@ final class NativeShellExecutor {
     ) throws -> NativeShellResult {
 
         guard isNativeExecAvailable else {
+            // Do not name a cause the probe cannot prove. The probe knows the
+            // errno and nothing else: EPERM is a sandbox refusal, ENOENT is a
+            // missing bash, and both have been reported to the user as "missing
+            // platform-application" — which was wrong whenever the helper had
+            // simply not been copied in.
+            let code = probeErrno
+            let reason = String(cString: strerror(code))
             throw NativeShellError.execUnavailable(
-                "missing \(RuntimePaths.platformEntitlement) entitlement")
+                "posix_spawn(bash) failed: \(reason) (errno \(code)); "
+                + "helper=\(bundledBash ?? "<not found>")")
         }
 
         let started = Date()

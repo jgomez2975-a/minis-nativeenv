@@ -356,13 +356,30 @@ func runFetch(manifestPath: String, docsDir: String, workDir: String, key: Strin
     }
     print("required     : ok (\(plan.requiredPaths.count) paths)")
 
-    // 6. PATH entries must resolve to something executable.
+    // 6. PATH entries are advisory; required paths are not.
+    //
+    // A pathEntries value names a directory to append to PATH, and a runtime is
+    // free to omit one — Theos lists usr/local/bin, which its payload does not
+    // contain. Treating that as a failure makes the rehearsal reject a runtime
+    // that installs correctly and works. Only the directories that DO exist
+    // have to be directories.
+    var missingEntries: [String] = []
     for entry in plan.pathEntries {
         let resolved = plan.resolvePathEntry(entry, root: dest,
                                              containerLibrary: dest)
-        let exists = FileManager.default.fileExists(atPath: resolved.path)
-        print("path entry   : \(entry) -> \(exists ? "present" : "MISSING")")
-        if !exists { return 1 }
+        var isDir: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: resolved.path,
+                                                    isDirectory: &isDir)
+        if exists && !isDir.boolValue {
+            print("path entry   : \(entry) -> present but NOT a directory")
+            return 1
+        }
+        print("path entry   : \(entry) -> \(exists ? "present" : "absent (allowed)")")
+        if !exists { missingEntries.append(entry) }
+    }
+    if !missingEntries.isEmpty {
+        print("note         : \(missingEntries.count) PATH entr(y/ies) absent from the "
+              + "payload; they are appended to PATH only when they exist")
     }
 
     print("")
