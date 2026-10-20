@@ -133,7 +133,18 @@ def check_workflow(repo: Path) -> None:
 # ---------------------------------------------------------------------------
 
 REQUIRED_ENTITLEMENTS = [
+    # The pair that gates executing a real arm64 process. Everything else is
+    # optional: `no-container` in particular is now deliberately absent, because
+    # Minis' own startup resolves an app container within seconds and a
+    # container-less process makes those paths unwritable — the app dies before
+    # reporting anything.
     "platform-application",
+    "get-task-allow",
+]
+
+# Present in some configurations, never required. Reported so a verdict is not
+# read as "these are fine to drop".
+OPTIONAL_ENTITLEMENTS = [
     "com.apple.private.security.no-sandbox",
     "com.apple.private.security.no-container",
 ]
@@ -155,7 +166,11 @@ def check_entitlements(repo: Path) -> None:
     if missing:
         fail(f"required entitlements absent or not true: {missing}")
     else:
-        ok(f"{len(data)} keys, platform entitlements present")
+        ok(f"{len(data)} keys, platform + get-task-allow present")
+    present_optional = [k for k in OPTIONAL_ENTITLEMENTS if data.get(k) is True]
+    if present_optional:
+        print(f"         container/sandbox overrides present: {len(present_optional)} "
+              f"(review: Minis expects a container)")
 
     # Stock Minis features must survive the swap, or a device tool dies quietly.
     for key in (
