@@ -218,12 +218,201 @@ func runTar(archivePath: String, workDir: String) -> Int32 {
     return 1
 }
 
+// MARK: - mode: fetch
+
+/// Rehearses a real install on the host, stopping only where the host genuinely
+/// cannot follow.
+///
+/// It downloads the published archive through the same proxy list the app uses,
+/// verifies the published SHA-256, decompresses with the same C shim, extracts
+/// with the same TarReader, and then checks that every path the plan requires
+/// exists. That is the whole pipeline except the last mile: signing and probing
+/// need an arm64 iOS binary, and this runs on macOS.
+///
+/// The point is that "it builds" and "it installs" are different claims, and only
+/// one of them can be made by reading the compiler's output.
+func runFetch(manifestPath: String, docsDir: String, workDir: String, key: String) -> Int32 {
+    guard let data = FileManager.default.contents(atPath: manifestPath) else {
+        die("cannot read \(manifestPath)")
+    }
+    let manifest: RuntimeManifest
+    do {
+        manifest = try JSONDecoder().decode(RuntimeManifest.self, from: data)
+    } catch {
+        die("manifest did not decode: \(error)")
+    }
+    guard let spec = manifest.runtimes[key] else {
+        die("no runtime named \(key); have: \(manifest.orderedKeys.joined(separator: ", "))")
+    }
+
+    let bundlePath = (docsDir as NSString).appendingPathComponent("\(key).json")
+    var bundle: RuntimeBundle?
+    if let blob = FileManager.default.contents(atPath: bundlePath) {
+        bundle = try? JSONDecoder().decode(RuntimeBundle.self, from: blob)
+    }
+    let plan = RuntimePlan(spec: spec, bundle: bundle)
+
+    print("runtime      : \(spec.displayName) \(spec.version)")
+    print("plan         : \(plan.pathEntries.joined(separator: ",")) "
+          + "req=\(plan.requiredPaths.count) sign=\(plan.signWithEntitlements.count)")
+    print("archive      : \(spec.archiveURL)")
+
+    // 1. Download, direct then each proxy — same order as the app.
+    var candidates = [spec.archiveURL]
+    for prefix in manifest.downloadProxyPrefixes { candidates.append(prefix + spec.archiveURL) }
+    for prefix in RuntimeInstallerProxyDefaults.prefixes where
+        !manifest.downloadProxyPrefixes.contains(prefix) {
+        candidates.append(prefix + spec.archiveURL)
+    }
+
+    var archivePath: String?
+    var attempts: [String] = []
+    for candidate in candidates {
+        guard let url = URL(string: candidate) else { continue }
+        let dest = (workDir as NSString).appendingPathComponent(
+            (spec.assetName as NSString?)?.lastPathComponent ?? "archive.bin")
+        let fetched = fetchSynchronously(url: url, to: dest)
+        if fetched == nil {
+            attempts.append("ok \(url.host ?? "-")")
+            archivePath = dest
+            break
+        }
+        attempts.append("\(url.host ?? "-"): \(fetched!)")
+    }
+    guard let archivePath else {
+        print("DOWNLOAD FAILED")
+        for a in attempts { print("  * \(a)") }
+        return 1
+    }
+    print("download     : ok (\(attempts.last ?? ""))")
+
+    // 2. Published checksum.
+    guard let actual = sha256Hex(of: URL(fileURLWithPath: archivePath)) else {
+        die("cannot hash downloaded archive")
+    }
+    if actual.caseInsensitiveCompare(spec.archiveSHA256) == .orderedSame {
+        print("sha256       : ok")
+    } else {
+        print("sha256       : MISMATCH")
+        print("  expected \(spec.archiveSHA256)")
+        print("  actual   \(actual)")
+        return 1
+    }
+
+    // 3. Decompress with the same shim the app links.
+    let tarPath = (workDir as NSString).appendingPathComponent("payload.tar")
+    FileManager.default.createFile(atPath: tarPath, contents: nil)
+    guard let out = FileHandle(forWritingTo: URL(fileURLWithPath: tarPath)) else {
+        die("cannot open \(tarPath)")
+    }
+    final class Sink { let handle: FileHandle; var failed = false
+        init(_ h: FileHandle) { handle = h } }
+    let sink = Sink(out)
+    let ctx = Unmanaged.passUnretained(sink).toOpaque()
+    let rc = ra_gunzip_stream(archivePath, { ctx, bytes, length -> Int32 in
+        guard let ctx, let bytes, length > 0 else { return 0 }
+        let sink = Unmanaged<Sink>.fromOpaque(ctx).takeUnretainedValue()
+        do {
+            try sink.handle.write(contentsOf: Data(bytes: bytes, count: length))
+            return 0
+        } catch {
+            sink.failed = true
+            return -1
+        }
+    }, ctx)
+    try? out.close()
+    guard rc == 0, !sink.failed else {
+        print("gunzip       : FAILED (rc=\(rc))")
+        return 1
+    }
+    let tarBytes = (try? FileManager.default.attributesOfItem(atPath: tarPath)[.size] as? NSNumber)??.intValue ?? 0
+    print("gunzip       : ok (\(tarBytes / 1_048_576) MB)")
+
+    // 4. Extract with the same reader.
+    let dest = URL(fileURLWithPath: workDir).appendingPathComponent("root")
+    try? FileManager.default.removeItem(at: dest)
+    let entries: [TarEntry]
+    do {
+        entries = try TarReader.extract(archive: URL(fileURLWithPath: tarPath), into: dest)
+    } catch {
+        print("tar          : FAILED — \(error)")
+        return 1
+    }
+    print("tar          : ok (\(entries.count) entries)")
+
+    // 5. The plan's own expectations.
+    var missing: [String] = []
+    for required in plan.requiredPaths {
+        if !FileManager.default.fileExists(atPath: dest.appendingPathComponent(required).path) {
+            missing.append(required)
+        }
+    }
+    if !missing.isEmpty {
+        print("required     : MISSING \(missing.count): \(missing.prefix(5).joined(separator: ", "))")
+        return 1
+    }
+    print("required     : ok (\(plan.requiredPaths.count) paths)")
+
+    // 6. PATH entries must resolve to something executable.
+    for entry in plan.pathEntries {
+        let resolved = plan.resolvePathEntry(entry, root: dest,
+                                             containerLibrary: dest)
+        let exists = FileManager.default.fileExists(atPath: resolved.path)
+        print("path entry   : \(entry) -> \(exists ? "present" : "MISSING")")
+        if !exists { return 1 }
+    }
+
+    print("")
+    print("OK — download, checksum, decompression, extraction and required paths "
+          + "all succeeded for \(key)")
+    print("     (signing and probing need an arm64 iOS binary; not exercised here)")
+    return 0
+}
+
+enum RuntimeInstallerProxyDefaults {
+    /// Mirrors RuntimeInstaller.defaultProxyPrefixes; kept here so the harness
+    /// does not have to link the installer actor and its Darwin dependencies.
+    static let prefixes = ["https://gh-proxy.org/", "https://ghproxy.net/"]
+}
+
+/// nil on success, an error string on failure.
+func fetchSynchronously(url: URL, to path: String) -> String? {
+    final class Box: @unchecked Sendable {
+        var result: String?
+    }
+    let box = Box()
+    let semaphore = DispatchSemaphore(value: 0)
+    var request = URLRequest(url: url)
+    request.timeoutInterval = 30
+    URLSession.shared.downloadTask(with: request) { location, response, error in
+        defer { semaphore.signal() }
+        if let error {
+            box.result = error.localizedDescription
+            return
+        }
+        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+            box.result = "HTTP \(http.statusCode)"
+            return
+        }
+        guard let location else { box.result = "no body"; return }
+        do {
+            try? FileManager.default.removeItem(atPath: path)
+            try FileManager.default.moveItem(at: location, to: URL(fileURLWithPath: path))
+        } catch {
+            box.result = error.localizedDescription
+        }
+    }.resume()
+    semaphore.wait()
+    return box.result
+}
+
 // MARK: - entry
 
 let args = CommandLine.arguments
 guard args.count >= 4 else {
     die("usage:\n  verify-host plans <manifest.json> <docs-dir>\n"
-        + "  verify-host tar <archive.tar> <work-dir>")
+        + "  verify-host tar <archive.tar> <work-dir>\n"
+        + "  verify-host fetch <manifest.json> <docs-dir> <work-dir> [runtime-key]")
 }
 
 switch args[1] {
@@ -231,6 +420,10 @@ case "plans":
     exit(runPlans(manifestPath: args[2], docsDir: args[3]))
 case "tar":
     exit(runTar(archivePath: args[2], workDir: args[3]))
+case "fetch":
+    guard args.count >= 5 else { die("usage: verify-host fetch <manifest> <docs> <workdir> [key]") }
+    let key = args.count >= 6 ? args[5] : "core_tools"
+    exit(runFetch(manifestPath: args[2], docsDir: args[3], workDir: args[4], key: key))
 default:
     die("unknown mode \(args[1])")
 }

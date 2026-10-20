@@ -38,7 +38,7 @@ concurrency:
 jobs:
   build:
     # macos-26 ships Xcode 26 / iOS 26 SDK, which IPHONEOS_DEPLOYMENT_TARGET=26.2
-    # requires. macos-latest is NOT enough — it may still resolve to 15.
+    # requires. macos-latest is NOT enough 鈥?it may still resolve to 15.
     runs-on: macos-26
     timeout-minutes: 300
 
@@ -54,7 +54,7 @@ jobs:
           set -eu
           for d in deps/ish deps/proot; do
             if [ -z "$(ls -A "$d" 2>/dev/null)" ]; then
-              echo "::error::$d is empty — submodule init failed"
+              echo "::error::$d is empty 鈥?submodule init failed"
               git submodule update --init --recursive "$d"
             fi
           done
@@ -89,8 +89,7 @@ jobs:
         # check. This runs every graft file through swiftc with the real C
         # header bridged in and stubs for the two Minis types it touches.
         #
-        # It exists because the first run found `Data().write(to:atomically:)` —
-        # an overload that does not exist — in RuntimeTar. xcodebuild would have
+        # It exists because the first run found `Data().write(to:atomically:)` 鈥?        # an overload that does not exist 鈥?in RuntimeTar. xcodebuild would have
         # reported the same thing 35 minutes later, after building iSH, FFmpeg
         # and rclone.
         run: |
@@ -120,11 +119,11 @@ jobs:
           )
           HDR=( -import-objc-header src/ios/RuntimeHost/RuntimeArchive.h )
 
-          # Pass 1 — host. Also the pass the verify binary is built from.
+          # Pass 1 鈥?host. Also the pass the verify binary is built from.
           swiftc -typecheck "${HDR[@]}" "${CORE[@]}" "${STUBS[@]}"
           echo "host type-check: ok (core)"
 
-          # Pass 2 — the real iOS SDK at the project's strictest deployment
+          # Pass 2 鈥?the real iOS SDK at the project's strictest deployment
           # target. Not redundant: posix_spawn's addchdir_np is merely
           # deprecated on macOS but explicitly unavailable on iOS, so a host-only
           # check passed while xcodebuild failed.
@@ -141,13 +140,21 @@ jobs:
         # only check that exercises Swift's actual decoding rather than a
         # re-implementation of it, and it costs a few seconds.
         run: |
-          set -eu
+          set -euo pipefail
+          # RuntimeArchive.c is what the app links for gzip. Compiling it here
+          # means the install rehearsal below exercises the same decompressor
+          # instead of a stand-in.
+          clang -c -O2 -I src/ios/RuntimeHost \
+            src/ios/RuntimeHost/RuntimeArchive.c -o /tmp/runtimearchive.o
+
           swiftc -O \
+            -import-objc-header src/ios/RuntimeHost/RuntimeArchive.h \
             src/ios/RuntimeHost/RuntimeManifest.swift \
             src/ios/RuntimeHost/RuntimePlan.swift \
             src/ios/RuntimeHost/RuntimePaths.swift \
             src/ios/RuntimeHost/RuntimeTar.swift \
             verify/main.swift \
+            /tmp/runtimearchive.o -lz \
             -o /tmp/verify-host
           echo "verify-host built"
 
@@ -208,8 +215,29 @@ jobs:
               for p in problems[:25]:
                   print('  *', p)
               sys.exit(1)
-          print(f'OK — {len(got)} entries match the fixture exactly')
+          print(f'OK 鈥?{len(got)} entries match the fixture exactly')
           PY
+
+      - name: Rehearse a real install on the host
+        # "It builds" and "it installs" are different claims, and only one of
+        # them can be made from the compiler's output. This runs the actual
+        # pipeline — download through the published proxies, verify the published
+        # SHA-256, decompress with the linked C shim, extract with the real
+        # TarReader, then assert that every path the plan requires exists — for
+        # the two smallest runtimes.
+        #
+        # Signing and probing stay out of reach: they execute arm64 iOS binaries,
+        # and this is macOS.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/install
+          for key in core_tools python; do
+            echo "=== $key"
+            /tmp/verify-host fetch /tmp/docs/manifest.json /tmp/docs /tmp/install "$key"
+            rm -rf /tmp/install/root || true
+            rm -f /tmp/install/*.tar /tmp/install/*.bin /tmp/install/*.gz || true
+          done
+          echo "::notice::install pipeline rehearsed end to end on the host"
 
       - name: Toolchain versions
         id: sdk
@@ -238,7 +266,7 @@ jobs:
 
           if [ -n "${SDKVER:-}" ] && [ -n "${NEEDED:-}" ] && \
              [ "$(printf '%s\n%s\n' "$SDKVER" "$NEEDED" | sort -V | head -1)" != "$NEEDED" ]; then
-            echo "::warning::iOS SDK $SDKVER is older than the project's $NEEDED — clamping deployment target to $SDKVER"
+            echo "::warning::iOS SDK $SDKVER is older than the project's $NEEDED 鈥?clamping deployment target to $SDKVER"
             echo "DEPLOYMENT_OVERRIDE=IPHONEOS_DEPLOYMENT_TARGET=$SDKVER" >> "$GITHUB_ENV"
           else
             echo "DEPLOYMENT_OVERRIDE=" >> "$GITHUB_ENV"
@@ -281,7 +309,7 @@ jobs:
           fi
 
       - name: Install ldid
-        # `ldid` (2.1.5, saurik's) is built without usable CMS output — it signs,
+        # `ldid` (2.1.5, saurik's) is built without usable CMS output 鈥?it signs,
         # exits 0, and writes a superblob with no CMS slot, so CoreTrust has
         # nothing to evaluate and the app dies at launch. `ldid-procursus` is the
         # fork that writes the fake chain, and it is the one packaged binaries
@@ -321,7 +349,7 @@ jobs:
         # yadif_videotoolbox deinterlace filter is silently dropped.
         run: |
           xcodebuild -downloadComponent MetalToolchain || \
-            echo "::warning::MetalToolchain download failed — FFmpeg loses yadif_videotoolbox"
+            echo "::warning::MetalToolchain download failed 鈥?FFmpeg loses yadif_videotoolbox"
           xcrun -sdk iphoneos metal --version || true
 
       - name: Cache native deps
@@ -421,7 +449,7 @@ jobs:
           # The exit status is captured rather than propagated immediately.
           # `xcodebuild | tee | tail` has produced a non-zero status after
           # printing ** BUILD SUCCEEDED ** on this runner, and under `set -e`
-          # that killed the step with no output at all — indistinguishable from a
+          # that killed the step with no output at all 鈥?indistinguishable from a
           # real compile failure. Capture it, report it, then decide using the
           # artifact and the log rather than trusting one number.
           set +e
@@ -479,8 +507,7 @@ jobs:
 
       - name: Report the signature shape
         # Informational, not a gate. `ldid -S` produces an ad-hoc signature with
-        # no CMS blob, and that is the normal shape for a TrollStore package —
-        # an earlier revision treated the absence of a CMS as the cause of a
+        # no CMS blob, and that is the normal shape for a TrollStore package 鈥?        # an earlier revision treated the absence of a CMS as the cause of a
         # launch crash and blocked two builds on a wrong premise. The check is
         # still worth printing: it distinguishes "signed at all" from "not
         # signed", which is a real failure.
@@ -514,3 +541,4 @@ jobs:
           name: xcodebuild-log
           path: build/xcodebuild.log
           retention-days: 7
+
