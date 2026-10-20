@@ -389,6 +389,35 @@ def check_coordinator(repo: Path) -> None:
             warn(f"expected `{needle}` ({why})")
 
 
+def check_swift_keywords(repo: Path) -> None:
+    print("\n[10] swift keyword identifiers")
+    # A variable named after a declaration modifier parses in most positions and
+    # then stops parsing in others — `required = [...]` inside a `case` body
+    # reads as the start of a declaration. That cost an hour to find once; this
+    # check makes it a five-second failure instead.
+    modifiers = {
+        "required", "optional", "convenience", "dynamic", "final", "lazy",
+        "override", "mutating", "nonmutating", "indirect", "prefix", "postfix",
+        "infix", "unowned", "weak", "open", "package", "static", "class",
+        "init", "deinit", "subscript", "typealias", "operator", "protocol",
+    }
+    pattern = re.compile(r"\b(?:var|let)\s+(" + "|".join(modifiers) + r")\s*[:=]")
+    found = 0
+    for src in sorted((repo / "src/ios/RuntimeHost").glob("*.swift")):
+        text = src.read_text(encoding="utf-8", errors="replace")
+        for lineno, line in enumerate(text.split("\n"), 1):
+            stripped = line.strip()
+            if stripped.startswith("//"):
+                continue
+            m = pattern.search(line)
+            if m:
+                fail(f"{src.name}:{lineno} declares a variable named `{m.group(1)}` "
+                     f"(Swift declaration modifier)")
+                found += 1
+    if found == 0:
+        ok("no variables shadowing declaration modifiers")
+
+
 def check_applogger(repo: Path) -> None:
     print("\n[9] AppLogger surface")
     path = repo / "src/ios/Shared/AppLogger.swift"
@@ -421,6 +450,7 @@ def main() -> int:
     check_bridging(repo)
     check_coordinator(repo)
     check_applogger(repo)
+    check_swift_keywords(repo)
 
     print()
     if failures:

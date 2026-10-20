@@ -54,7 +54,10 @@ struct RuntimeSpec: Decodable {
     let group: String?
     let handler: String?
     let minimumIOS: String?
-    let optional: Bool
+    /// Named `isOptional` rather than `optional`: the latter is a Swift
+    /// declaration modifier, and an identifier that doubles as a keyword is a
+    /// parse hazard in exactly the positions that are hard to debug.
+    let isOptional: Bool
     let order: Int?
     let runtimeFormat: Int?
 
@@ -76,9 +79,25 @@ struct RuntimeSpec: Decodable {
     let radare2Version: String?
     let sdk: String?
 
+    /// Present on every runtime but only authoritative when `install` is absent.
+    let runtimeID: String?
+    let format: Int?
+
+    /// Declared at the top level by the formats with no `install` block
+    /// (python, reverse_tools). Same meaning as `install.sign_paths`.
+    let signPaths: [String]?
+
+    /// theos only: the exact binaries and dylibs to re-sign.
+    let executables: [String]?
+    let libraries: [String]?
+
+    /// theos only: scripts whose shebang points at `env`, which finds nothing on iOS.
+    let portableShebangs: [ShebangRewrite]?
+
     enum CodingKeys: String, CodingKey {
         case displayName = "display_name"
-        case version, revision, summary, group, handler, optional, order, components, install, sdk
+        case version, revision, summary, group, handler, order, components, install, sdk
+        case isOptional = "optional"
         case minimumIOS = "minimum_ios"
         case runtimeFormat = "runtime_format"
         case archiveURL = "archive_url"
@@ -92,6 +111,11 @@ struct RuntimeSpec: Decodable {
         case pythonVersion = "python_version"
         case llvmVersion = "llvm_version"
         case radare2Version = "radare2_version"
+        case runtimeID = "runtime_id"
+        case format
+        case signPaths = "sign_paths"
+        case executables, libraries
+        case portableShebangs = "portable_shebangs"
     }
 
     /// The `handler` tells the host how to unpack and where the payload's root
@@ -134,6 +158,38 @@ struct InstallProbe: Decodable {
     let executable: String
     let arguments: [String]
     let contains: String
+}
+
+// MARK: - Per-runtime descriptor
+
+/// The document behind a runtime's `metadata_url`.
+///
+/// runtime-manifest.json is an *index*, not the full description. Three of the
+/// six useful runtimes — python, reverse_tools, theos — carry no `install` and
+/// no `sign_paths` in the index at all; their sign targets and layout live only
+/// here. Reading the index alone therefore produces an install that puts files
+/// on disk and never re-signs them, which on iOS means every one of those
+/// binaries fails at exec with a bare EPERM.
+struct RuntimeBundle: Decodable {
+    let format: Int?
+    let runtimeID: String?
+    let install: InstallInstructions?
+    let signPaths: [String]?
+    let signPathsWithoutEntitlements: [String]?
+    let executables: [String]?
+    let libraries: [String]?
+    let portableShebangs: [ShebangRewrite]?
+    let sdk: String?
+
+    enum CodingKeys: String, CodingKey {
+        case format
+        case runtimeID = "runtime_id"
+        case install
+        case signPaths = "sign_paths"
+        case signPathsWithoutEntitlements = "sign_paths_without_entitlements"
+        case executables, libraries, sdk
+        case portableShebangs = "portable_shebangs"
+    }
 }
 
 // MARK: - Install state

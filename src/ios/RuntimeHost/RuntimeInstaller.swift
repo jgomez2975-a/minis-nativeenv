@@ -141,6 +141,17 @@ actor RuntimeInstaller {
         progress?(0.02, "preparing")
         let archive = try await fetchArchive(spec: spec, progress: progress)
 
+        // The index does not describe the layout for every runtime; the
+        // per-runtime descriptor does. Fetch it before planning, because a plan
+        // derived without it can only guess at the sign set — and an unsigned
+        // binary is an unexecutable one.
+        progress?(0.06, "reading descriptor")
+        let bundle = await fetchBundle(spec: spec)
+        if bundle == nil, spec.metadataURL != nil {
+            log.warning("descriptor unavailable for \(key); plan falls back to the index")
+        }
+        let plan = RuntimePlan(spec: spec, bundle: bundle)
+
         progress?(0.55, "verifying")
         let digest = try sha256Hex(of: archive)
         guard digest.caseInsensitiveCompare(spec.archiveSHA256) == .orderedSame else {
@@ -163,20 +174,27 @@ actor RuntimeInstaller {
             throw error
         }
 
-        let payload = try locatePayloadRoot(in: staging, handler: spec.handler ?? "portable-v1")
+        let payload = try locatePayloadRoot(in: staging, markers: plan.rootMarkers)
 
-        if let install = spec.install {
-            progress?(0.80, "checking")
-            let missing = install.requiredPaths.filter {
-                !fileManager.fileExists(atPath: payload.appendingPathComponent($0).path)
-            }
-            guard missing.isEmpty else {
-                try? fileManager.removeItem(at: staging)
-                throw InstallerError.missingPaths(missing)
-            }
+        progress?(0.80, "checking")
+        let missing = plan.requiredPaths.filter {
+            !fileManager.fileExists(atPath: payload.appendingPathComponent($0).path)
+        }
+        guard missing.isEmpty else {
+            try? fileManager.removeItem(at: staging)
+            throw InstallerError.missingPaths(missing)
+        }
 
+        // Scripts that open with `#!/usr/bin/env perl` cannot work on iOS:
+        // there is no /usr/bin/env, and no perl on PATH until theos is on it.
+        if !plan.shebangRewrites.isEmpty {
+            progress?(0.82, "rewriting shebangs")
+            applyShebangRewrites(plan.shebangRewrites, root: payload)
+        }
+
+        if !plan.signWithEntitlements.isEmpty || !plan.signAdhocOnly.isEmpty {
             progress?(0.85, "signing")
-            try signBinaries(install: install, root: payload)
+            try signBinaries(plan: plan, root: payload)
         }
 
         // Commit: move into place under the revision, then flip `current`.
@@ -208,7 +226,7 @@ actor RuntimeInstaller {
                                  lastProbeOutput: nil,
                                  failure: nil)
 
-        if let install = spec.install, let probe = install.probe {
+        if let probe = plan.probe, !probe.contains.isEmpty {
             do {
                 let out = try runProbe(probe, root: finalDir)
                 state.lastProbeOK = true
@@ -219,13 +237,21 @@ actor RuntimeInstaller {
                 throw error
             }
         } else {
-            state.lastProbeOK = true
+            // No sentinel to look for. Trust the file checks that already ran and
+            // record why, so the panel does not imply a probe happened.
+            state.lastProbeOK = plan.requiredPaths.allSatisfy {
+                fileManager.fileExists(atPath: finalDir.appendingPathComponent($0).path)
+            }
+            state.lastProbeOutput = "no sentinel probe; verified by required_paths"
         }
 
         writeState(state)
         rebuildPathManifest()
         progress?(1.0, "done")
         log.info("installed \(key) \(spec.version) -> \(finalDir.path)")
+        if !plan.derivedNotes.isEmpty {
+            log.info("plan notes for \(key): \(plan.derivedNotes.joined(separator: "; "))")
+        }
         return state
     }
 
@@ -236,7 +262,8 @@ actor RuntimeInstaller {
               let spec = (try? await loadManifest())?.runtimes[key],
               fileManager.fileExists(atPath: state.installedRoot) else { return nil }
 
-        guard let install = spec.install, let probe = install.probe else { return state }
+        let plan = RuntimePlan(spec: spec, bundle: loadBundle(spec: spec))
+        guard let probe = plan.probe, !probe.contains.isEmpty else { return state }
         do {
             let out = try runProbe(probe, root: URL(fileURLWithPath: state.installedRoot))
             var updated = state
@@ -281,22 +308,29 @@ actor RuntimeInstaller {
         var env: [String: String] = [:]
 
         var pathComponents: [String] = [paths.binDir.path]
-        let states = installedStates()
+        let states = installedStates().filter(\.lastProbeOK)
+        let library = paths.containerLibrary
 
+        var plans: [(RuntimePlan, URL)] = []
         if let m = manifest {
-            for state in states where state.lastProbeOK {
-                guard let spec = m.runtimes[state.key], let install = spec.install else { continue }
-                let root = URL(fileURLWithPath: state.installedRoot)
-                for entry in install.pathEntries {
-                    pathComponents.append(root.appendingPathComponent(entry).path)
-                }
+            for state in states {
+                guard let spec = m.runtimes[state.key] else { continue }
+                plans.append((RuntimePlan(spec: spec, bundle: loadBundle(spec: spec)),
+                              URL(fileURLWithPath: state.installedRoot)))
             }
-            for state in states where state.lastProbeOK {
-                guard let spec = m.runtimes[state.key],
-                      let persistent = spec.install?.persistentPathEntries else { continue }
-                for entry in persistent {
-                    pathComponents.append(expand(entry, root: URL(fileURLWithPath: state.installedRoot)).path)
-                }
+        }
+
+        // Ordering rule: every runtime's own path entries first (so `rg`, `git`,
+        // `python3`, `r2` resolve to the runtime copy), then the container-level
+        // persistent prefixes such as npm's global bin, then the system dirs.
+        for (plan, root) in plans {
+            for entry in plan.pathEntries {
+                pathComponents.append(plan.resolvePathEntry(entry, root: root, containerLibrary: library).path)
+            }
+        }
+        for (plan, root) in plans {
+            for entry in plan.persistentPathEntries {
+                pathComponents.append(plan.resolvePathEntry(entry, root: root, containerLibrary: library).path)
             }
         }
 
@@ -317,13 +351,9 @@ actor RuntimeInstaller {
         env["CA_TOOL_RUNTIME_ROOT"] = paths.root.path
         env["DEVELOPER_DIR"] = paths.root.path
 
-        if let m = manifest {
-            for state in states where state.lastProbeOK {
-                guard let spec = m.runtimes[state.key], let vars = spec.install?.environment else { continue }
-                let root = URL(fileURLWithPath: state.installedRoot)
-                for (k, v) in vars {
-                    env[k] = expand(v, root: root).path
-                }
+        for (plan, root) in plans {
+            for (k, v) in plan.environment {
+                env[k] = expand(v, root: root).path
             }
         }
 
@@ -344,6 +374,45 @@ actor RuntimeInstaller {
     private func expand(_ template: String, root: URL) -> URL {
         let replaced = template.replacingOccurrences(of: "${RUNTIME_ROOT}", with: root.path)
         return URL(fileURLWithPath: replaced)
+    }
+
+    // MARK: - Per-runtime descriptor
+
+    /// Fetches the runtime's own `metadata_url` document and caches it.
+    ///
+    /// The manifest is an index; the descriptor is the install spec. Fetching
+    /// is best-effort: a device offline at install time still gets a usable
+    /// plan from the index plus the format reconstruction, and `derivedNotes`
+    /// records that it was a reconstruction.
+    private func fetchBundle(spec: RuntimeSpec) async -> RuntimeBundle? {
+        let cache = bundleCacheURL(spec)
+        if let data = try? Data(contentsOf: cache),
+           let decoded = try? JSONDecoder().decode(RuntimeBundle.self, from: data) {
+            return decoded
+        }
+        guard let urlString = spec.metadataURL, let url = URL(string: urlString) else { return nil }
+        do {
+            let (data, response) = try await URLSession.shared.data(from: url)
+            guard (response as? HTTPURLResponse)?.statusCode == 200,
+                  let decoded = try? JSONDecoder().decode(RuntimeBundle.self, from: data)
+            else { return nil }
+            try? fileManager.createDirectory(at: paths.cacheDir, withIntermediateDirectories: true)
+            try? data.write(to: cache, options: .atomic)
+            return decoded
+        } catch {
+            log.warning("descriptor fetch failed for \(spec.displayName): \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Synchronous descriptor read for the paths that cannot await.
+    private func loadBundle(spec: RuntimeSpec) -> RuntimeBundle? {
+        guard let data = try? Data(contentsOf: bundleCacheURL(spec)) else { return nil }
+        return try? JSONDecoder().decode(RuntimeBundle.self, from: data)
+    }
+
+    private func bundleCacheURL(_ spec: RuntimeSpec) -> URL {
+        paths.cacheDir.appendingPathComponent("\(spec.revisionKey).bundle.json")
     }
 
     // MARK: - Download
@@ -597,7 +666,7 @@ actor RuntimeInstaller {
             let sizeStr = field(124, 12)
             let typeflag = header[156]
             let linkName = field(157, 100)
-            let prefix = field(345, 155)
+            let namePrefix = field(345, 155)
 
             let size = parseTarSize(sizeStr)
 
@@ -627,7 +696,7 @@ actor RuntimeInstaller {
                 break
             }
 
-            var entryName = pendingLongName ?? pendingPaxPath ?? (prefix.isEmpty ? name : "\(prefix)/\(name)")
+            var entryName = pendingLongName ?? pendingPaxPath ?? (namePrefix.isEmpty ? name : "\(namePrefix)/\(name)")
             pendingLongName = nil
             pendingPaxPath = nil
             entryName = entryName.trimmingCharacters(in: CharacterSet(charactersIn: "\0/"))
@@ -687,13 +756,14 @@ actor RuntimeInstaller {
     // MARK: - Payload root
 
     /// Some tarballs wrap everything in a single top directory; some do not.
-    /// Normalise so the caller always gets the directory that holds `bin/`.
-    private func locatePayloadRoot(in staging: URL, handler: String) throws -> URL {
+    /// `markers` comes from the runtime's own plan, so python's `python3` and
+    /// theos's `theos/` are recognised as roots the same way `bin/` is.
+    private func locatePayloadRoot(in staging: URL, markers: Set<String>) throws -> URL {
         let contents = try fileManager.contentsOfDirectory(at: staging,
                                                            includingPropertiesForKeys: [.isDirectoryKey],
                                                            options: [.skipsHiddenFiles])
         // Already a payload root?
-        if contents.contains(where: { ["bin", "lib", "sdks", "Frameworks"].contains($0.lastPathComponent) }) {
+        if contents.contains(where: { markers.contains($0.lastPathComponent) }) {
             return staging
         }
         // Single wrapper directory?
@@ -702,7 +772,68 @@ actor RuntimeInstaller {
             let isDir = (try? only.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
             if isDir { return only }
         }
-        throw InstallerError.extractionFailed("cannot determine payload root (\(contents.count) top-level entries)")
+        throw InstallerError.extractionFailed(
+            "cannot determine payload root (\(contents.count) top-level entries: "
+            + contents.prefix(6).map(\.lastPathComponent).joined(separator: ", ") + ")")
+    }
+
+    // MARK: - Shebangs
+
+    /// Repoints `#!/usr/bin/env <interp>` at the interpreter inside this
+    /// runtime. Driven by the manifest's `portable_shebangs` list rather than a
+    /// scan, so a script that deliberately uses the system interpreter is left
+    /// alone.
+    ///
+    /// Each file is read whole and rewritten atomically. These are scripts of a
+    /// few KB; an in-place offset overlay would have to reason about a
+    /// replacement of different length, and getting that wrong truncates the
+    /// script instead of fixing it.
+    private func applyShebangRewrites(_ rewrites: [ShebangRewrite], root: URL) {
+        var changed = 0
+        for rewrite in rewrites {
+            let file = root.appendingPathComponent(rewrite.path)
+            guard let data = try? Data(contentsOf: file), !data.isEmpty,
+                  data.starts(with: Array("#!".utf8)),
+                  let newlineIndex = data.firstIndex(of: 0x0A),
+                  let oldLine = String(data: data[..<newlineIndex], encoding: .utf8),
+                  oldLine == rewrite.original else { continue }
+
+            let interpreter = resolveInterpreter(rewrite.interpreter, root: root)
+                ?? rewrite.interpreter
+            var newLine = "#!" + interpreter
+            if !rewrite.arguments.isEmpty {
+                newLine += " " + rewrite.arguments.joined(separator: " ")
+            }
+            guard let newLineData = (newLine + "\n").data(using: .utf8) else { continue }
+
+            var updated = newLineData
+            updated.append(data[(newlineIndex + 1)...])
+            if (try? updated.write(to: file, options: .atomic)) != nil {
+                // Atomic write replaces the inode, so the +x bit has to be
+                // restored or the script stops being executable.
+                _ = chmod(file.path, 0o755)
+                changed += 1
+            }
+        }
+        if changed > 0 {
+            log.info("rewrote \(changed) shebang(s) for theos")
+        }
+    }
+
+    /// Finds the interpreter inside the runtime, in the places these bundles put
+    /// them, before falling back to a bare name resolved through PATH.
+    private func resolveInterpreter(_ name: String, root: URL) -> String? {
+        let candidates = [
+            "bin/\(name)",
+            "usr/bin/\(name)",
+            "theos/bin/\(name)",
+            "usr/local/bin/\(name)",
+        ]
+        for candidate in candidates {
+            let path = root.appendingPathComponent(candidate)
+            if fileManager.isExecutableFile(atPath: path.path) { return path.path }
+        }
+        return nil
     }
 
     // MARK: - Signing
@@ -712,7 +843,7 @@ actor RuntimeInstaller {
     /// entitlement-carrying pass) fakes a CMS so CoreTrust accepts the result.
     /// `ldid -S` is not used because it cannot produce a blob CoreTrust accepts
     /// for a platform binary on modern iOS.
-    private func signBinaries(install: InstallInstructions, root: URL) throws {
+    private func signBinaries(plan: RuntimePlan, root: URL) throws {
         guard let signer = Bundle.main.url(forAuxiliaryExecutable: "Helpers/codex-sign")
                 ?? bundledHelper("codex-sign") else {
             // No signer means an ad-hoc signed payload; still assign +x so a
@@ -721,16 +852,20 @@ actor RuntimeInstaller {
             return
         }
 
-        let withEntitlements = install.signPaths.map { root.appendingPathComponent($0) }
+        let withEntitlements = plan.signWithEntitlements
+            .map { root.appendingPathComponent($0) }
             .filter { fileManager.fileExists(atPath: $0.path) }
-        let adhocOnly = install.signPathsWithoutEntitlements.map { root.appendingPathComponent($0) }
+        let adhocOnly = plan.signAdhocOnly
+            .map { root.appendingPathComponent($0) }
             .filter { fileManager.fileExists(atPath: $0.path) }
 
-        if !withEntitlements.isEmpty {
-            try runSigner(signer, files: withEntitlements, entitlements: nil, adhocOnly: false)
+        // theos declares ~30 000 sign targets. One argv that large exceeds
+        // ARG_MAX and posix_spawn fails before exec, so every batch is bounded.
+        for batch in withEntitlements.chunked(into: 128) {
+            try runSigner(signer, files: batch, entitlements: nil, adhocOnly: false)
         }
-        if !adhocOnly.isEmpty {
-            try runSigner(signer, files: adhocOnly, entitlements: nil, adhocOnly: true)
+        for batch in adhocOnly.chunked(into: 128) {
+            try runSigner(signer, files: batch, entitlements: nil, adhocOnly: true)
         }
     }
 
@@ -803,12 +938,13 @@ actor RuntimeInstaller {
     private func rebuildPathManifest() {
         var lines: [String] = []
         if let m = manifest {
+            let library = paths.containerLibrary
             for state in installedStates() where state.lastProbeOK {
-                guard let spec = m.runtimes[state.key],
-                      let persistent = spec.install?.persistentPathEntries else { continue }
+                guard let spec = m.runtimes[state.key] else { continue }
+                let plan = RuntimePlan(spec: spec, bundle: loadBundle(spec: spec))
                 let root = URL(fileURLWithPath: state.installedRoot)
-                for entry in persistent {
-                    lines.append(expand(entry, root: root).path)
+                for entry in plan.persistentPathEntries {
+                    lines.append(plan.resolvePathEntry(entry, root: root, containerLibrary: library).path)
                 }
             }
         }

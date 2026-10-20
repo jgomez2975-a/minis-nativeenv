@@ -126,5 +126,15 @@ struct RuntimePaths {
             : Self.containerRoot.appendingPathComponent("home", isDirectory: true)
     }
 
+    /// The app container's `Library` directory.
+    ///
+    /// Some runtimes declare path entries relative to *this* rather than to the
+    /// runtime root — node's `Library/Application Support/CodexApp/Node/prefix/bin`
+    /// is where `npm i -g` puts global binaries, and resolving it against the
+    /// runtime root would point at a directory nothing ever writes to.
+    var containerLibrary: URL {
+        FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+    }
+
     var tmpDir: URL { root.appendingPathComponent("tmp", isDirectory: true) }
 }

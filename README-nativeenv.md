@@ -179,3 +179,44 @@ App Store 装法、AltStore/SideStore 免费证书都装不上 —— `platform-
 - **runner 上 iOS 26.2 SDK 在不在**。workflow 里做了自动降级(读到低于 26.2 的 SDK 就压低部署目标),
   但降级之后能不能编过没验过。
 
+---
+
+## 7. 第二轮挖出的两个结构性问题
+
+### 7.1 manifest 不是完整描述,只是索引
+
+`runtime-manifest.json` 里 `python` / `reverse_tools` / `theos` **没有 `install` 块,也没有 `sign_paths`**。
+签名清单只在各自的 `metadata_url`(即 `*.bundle.json`)里。
+
+只读索引的后果:这三个装完,文件躺在那儿,**一个二进制都没重签名**。iOS 上未签名的映像 exec 直接 EPERM,
+而且报错里不会告诉你"你没签名"。这才是最贵的 bug —— 装完看着完全正常。
+
+所以加了 `RuntimeBundle`,安装时先拉 `metadata_url` 并缓存,`RuntimePlan` 以描述符为准、索引兜底。
+用真实文档跑了一遍推导:
+
+| runtime | PATH | required | 签名目标 | shebang 改写 | probe |
+|---|---|---|---|---|---|
+| core_tools | `bin` | 11 | 6 | 0 | `bin/git` |
+| node | `bin` | 23 | 2 (+1 adhoc) | 0 | `bin/node` |
+| ollvm | `bin` | 5 | 1 | 0 | `bin/clang` |
+| reverse_tools | `bin` | 2 | **8** | 0 | 无 |
+| python | `.`(根) | 1 | **70** | 0 | 无 |
+| theos | 4 条 | 2 | **362** | **109** | 无 |
+
+修复前 reverse_tools / python / theos 的签名目标是 **0**。修复后 8 / 70 / 362。
+
+顺带:theos 的 109 个 `#!/usr/bin/env perl` 脚本在 iOS 上根本跑不起来(iOS 没有 `/usr/bin/env`)。
+现在按 `portable_shebangs` 清单重写首行并还原 `+x`。
+
+### 7.2 `required` 不能当变量名
+
+`RuntimePlan` 里我原本写了个 `var required: [String]`。它**能通过部分位置的解析,然后在 `case` 体里炸** ——
+`required` 是 Swift 的声明修饰符,`required = [...]` 在 case body 里会被读成一个声明开头。
+
+这是靠 tree-sitter 一路二分查出来的(14 个 ERROR 节点,删任何单行都不修复,最后靠整文件替换关键字定位)。
+现在改成 `reqPaths`,并且 `preflight.py` 加了第 10 项检查:扫描 `var|let <声明修饰符>` 形式的变量声明,
+`required` / `optional` / `prefix` / `weak` / `final` 这一批全查。已经用注入案例反向验证过能抓到。
+
+同批顺手改名:`optional` → `isOptional`(manifest 模型)、`prefix` → `namePrefix`(tar 头解析)。
+
+
