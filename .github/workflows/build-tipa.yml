@@ -384,10 +384,16 @@ jobs:
         # exists and the embed phase fails validation.
         run: |
           set -euo pipefail
-          # pipefail is not decoration: without it the exit status of
-          # `xcodebuild | tee | tail` is tail's, so a failed compile looked like
-          # a success and the packaging step then found a half-written .app with
-          # no Info.plist.
+          mkdir -p build
+          XCB_LOG="build/xcodebuild.log"
+
+          # The exit status is captured rather than propagated immediately.
+          # `xcodebuild | tee | tail` has produced a non-zero status after
+          # printing ** BUILD SUCCEEDED ** on this runner, and under `set -e`
+          # that killed the step with no output at all — indistinguishable from a
+          # real compile failure. Capture it, report it, then decide using the
+          # artifact and the log rather than trusting one number.
+          set +e
           xcodebuild \
             -project src/ios/Minis.xcodeproj \
             -scheme Minis \
@@ -399,19 +405,22 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             ONLY_ACTIVE_ARCH=NO \
             ${DEPLOYMENT_OVERRIDE:-} \
-            build 2>&1 | tee build/xcodebuild.log | tail -60
+            build 2>&1 | tee "$XCB_LOG" | tail -60
+          xcb_status=$?
+          set -e
+          echo "xcodebuild pipeline exit: $xcb_status"
 
-          # `find -print -quit`, not `find | head -1`. Under pipefail the pipe
-          # reports SIGPIPE from find (141) and `set -e` kills the step with no
-          # output at all — which is exactly how a successful build ended up
-          # looking like a failure.
+          # `find -print -quit`, not `find | head -1`: under pipefail the pipe
+          # reports SIGPIPE from find and kills the step.
           APP=$(find build/DD/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" -print -quit)
-          test -n "$APP" || { echo "::error::no .app produced"; exit 1; }
-          test -f "$APP/Info.plist" || {
-            echo "::error::$APP has no Info.plist — the build did not complete"
-            ls -1 "$APP" | sed -n '1,30p'
+
+          if [ "$xcb_status" -ne 0 ] || [ -z "$APP" ] || [ ! -f "$APP/Info.plist" ]; then
+            echo "::error::build did not produce a usable bundle (exit=$xcb_status app='$APP')"
+            grep -nE "(^| )error:|\*\* BUILD FAILED" "$XCB_LOG" | sed -n '1,25p' || true
+            [ -n "$APP" ] && ls -1 "$APP" | sed -n '1,30p' || true
             exit 1
-          }
+          fi
+
           echo "APP=$APP" >> $GITHUB_ENV
           echo "built: $APP"
           du -sh "$APP"
