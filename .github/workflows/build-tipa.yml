@@ -302,12 +302,16 @@ jobs:
           test -n "$LDID" || { echo "::error::no ldid found"; exit 1; }
           echo "ldid: $LDID ($("$LDID" 2>&1 | head -1))"
 
-          # Prove it writes a CMS before the build depends on it.
+          # Prove it signs at all. It is NOT required to produce a CMS: `ldid -S`
+          # writes an ad-hoc signature with no CMS blob by design, and that is
+          # the normal shape for a TrollStore package. This reports which shape
+          # came out; treating "no CMS" as fatal blocked two builds on a premise
+          # that turned out to be false.
           cp /bin/echo /tmp/ldid-probe
           "$LDID" -Sentitlements/Minis-TrollStore.entitlements /tmp/ldid-probe
-          python3 scripts/sig_probe.py /tmp/ldid-probe
+          python3 scripts/sig_probe.py /tmp/ldid-probe || true
           rm -f /tmp/ldid-probe
-          echo "::notice::ldid can produce a CMS"
+          echo "::notice::ldid available: $LDID"
 
       - name: Disk headroom
         run: df -h / /Users/runner
