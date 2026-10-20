@@ -388,14 +388,20 @@ actor RuntimeInstaller {
         // Ordering rule: every runtime's own path entries first (so `rg`, `git`,
         // `python3`, `r2` resolve to the runtime copy), then the container-level
         // persistent prefixes such as npm's global bin, then the system dirs.
+        //
+        // Only directories that exist are appended. A runtime may list a PATH
+        // entry its payload does not contain — Theos names usr/local/bin and
+        // ships no such directory. The shell tolerates a dead PATH component, but
+        // this list is also handed to the model as the environment description,
+        // where a path that is not there reads as a tool that is.
         for (plan, root) in plans {
-            for entry in plan.pathEntries {
-                pathComponents.append(plan.resolvePathEntry(entry, root: root, containerLibrary: library).path)
-            }
-        }
-        for (plan, root) in plans {
-            for entry in plan.persistentPathEntries {
-                pathComponents.append(plan.resolvePathEntry(entry, root: root, containerLibrary: library).path)
+            for entry in plan.pathEntries + plan.persistentPathEntries {
+                let resolved = plan.resolvePathEntry(entry, root: root,
+                                                     containerLibrary: library).path
+                var isDir: ObjCBool = false
+                guard fileManager.fileExists(atPath: resolved, isDirectory: &isDir),
+                      isDir.boolValue else { continue }
+                pathComponents.append(resolved)
             }
         }
 
