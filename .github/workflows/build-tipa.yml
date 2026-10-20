@@ -274,20 +274,33 @@ jobs:
           fi
 
       - name: Install ldid
-        # Required, not optional: `codesign -s -` writes a CMS wrapper with zero
-        # bytes of payload, so the package installs and then the app is killed at
-        # launch. ldid -S writes the fake certificate chain CoreTrust actually
-        # evaluates, which is the mechanism TrollStore depends on.
+        # `ldid` (2.1.5, saurik's) is built without usable CMS output — it signs,
+        # exits 0, and writes a superblob with no CMS slot, so CoreTrust has
+        # nothing to evaluate and the app dies at launch. `ldid-procursus` is the
+        # fork that writes the fake chain, and it is the one packaged binaries
+        # are expected to use.
+        #
+        # The self-test runs here, two minutes in, rather than after the build.
         run: |
           set -euo pipefail
-          brew install ldid || true
-          if command -v ldid >/dev/null 2>&1; then
-            echo "ldid: $(command -v ldid)"
-            ldid 2>&1 | head -3 || true
-          else
-            echo "::error::ldid unavailable — ad-hoc codesign cannot produce a trusted signature"
-            exit 1
-          fi
+          brew install ldid-procursus || true
+
+          LDID=""
+          for candidate in \
+            /opt/homebrew/opt/ldid-procursus/bin/ldid \
+            /opt/homebrew/bin/ldid \
+            /usr/local/bin/ldid; do
+            if [ -x "$candidate" ]; then LDID="$candidate"; break; fi
+          done
+          test -n "$LDID" || { echo "::error::no ldid found"; exit 1; }
+          echo "ldid: $LDID ($("$LDID" 2>&1 | head -1))"
+
+          # Prove it writes a CMS before the build depends on it.
+          cp /bin/echo /tmp/ldid-probe
+          "$LDID" -Sentitlements/Minis-TrollStore.entitlements /tmp/ldid-probe
+          python3 scripts/sig_probe.py /tmp/ldid-probe
+          rm -f /tmp/ldid-probe
+          echo "::notice::ldid can produce a CMS"
 
       - name: Disk headroom
         run: df -h / /Users/runner

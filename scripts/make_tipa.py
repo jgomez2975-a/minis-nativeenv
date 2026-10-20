@@ -145,7 +145,12 @@ class Signer:
         self.entitlements = entitlements
 
         self.ldid = None
-        for candidate in ("/usr/local/bin/ldid", "/opt/homebrew/bin/ldid", which("ldid")):
+        for candidate in (
+            "/opt/homebrew/opt/ldid-procursus/bin/ldid",   # writes the fake chain
+            "/usr/local/bin/ldid",
+            "/opt/homebrew/bin/ldid",                       # 2.1.5: no CMS output
+            which("ldid"),
+        ):
             if candidate and Path(candidate).exists():
                 self.ldid = candidate
                 break

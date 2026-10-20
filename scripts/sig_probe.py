@@ -170,9 +170,22 @@ def describe(name: str, data: bytes) -> bool:
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print("usage: sig_probe.py <file.tipa>")
+        print("usage: sig_probe.py <file.tipa | mach-o>")
         return 2
-    z = zipfile.ZipFile(sys.argv[1])
+
+    target = sys.argv[1]
+
+    # A bare Mach-O is the cheap case: this is what the signer self-test feeds
+    # it, so a signer that cannot produce a CMS fails two minutes into a run
+    # instead of after a full build.
+    if not zipfile.is_zipfile(target):
+        data = open(target, "rb").read()
+        ok = describe(target.rsplit("/", 1)[-1], data)
+        print()
+        print("VERDICT:", "CMS present" if ok else "no usable CMS")
+        return 0 if ok else 1
+
+    z = zipfile.ZipFile(target)
     names = z.namelist()
 
     binaries = []
@@ -180,16 +193,13 @@ def main() -> int:
         if not n.startswith("Payload/"):
             continue
         parts = n.split("/")
-        if len(parts) == 3 and parts[2].endswith(".app") is False and "/" not in parts[2]:
-            # Payload/Minis.app/Minis
-            if parts[2] == "Minis":
-                binaries.append(n)
-    # app executables inside PlugIns and Frameworks
+        if len(parts) == 3 and parts[2] == "Minis":
+            binaries.append(n)
     for n in names:
         if "/PlugIns/" in n and n.count("/") == 4 and not n.endswith("/"):
             binaries.append(n)
 
-    print(f"probing {len(binaries)} binaries in {sys.argv[1]}\n")
+    print(f"probing {len(binaries)} binaries in {target}\n")
     cms_count = 0
     for n in binaries:
         with z.open(n) as fh:
@@ -202,11 +212,10 @@ def main() -> int:
 
     print()
     if cms_count == 0:
-        print("VERDICT: no binary carries a CMS blob. Ad-hoc signatures embed")
-        print("entitlements but CoreTrust rejects them at launch — that matches")
-        print("an immediate crash with no app-level log.")
+        print("VERDICT: no binary carries a usable CMS blob. CoreTrust has nothing")
+        print("to evaluate and the app is killed at exec with no useful log.")
         return 1
-    print(f"VERDICT: {cms_count} binary/binaries carry CMS")
+    print(f"VERDICT: {cms_count} binary/binaries carry a usable CMS")
     return 0
 
 
