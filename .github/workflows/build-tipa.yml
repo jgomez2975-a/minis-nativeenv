@@ -20,8 +20,15 @@ on:
         default: "1.0.5"
   push:
     branches: [main, nativeenv]
+    # Anything the build actually consumes. The earlier list covered only
+    # src/ios/RuntimeHost and this file, so a fix touching scripts/, patches/ or
+    # entitlements/ pushed cleanly and then silently did not build.
     paths:
       - "src/ios/RuntimeHost/**"
+      - "scripts/**"
+      - "patches/**"
+      - "verify/**"
+      - "entitlements/**"
       - ".github/workflows/build-tipa.yml"
 
 concurrency:
