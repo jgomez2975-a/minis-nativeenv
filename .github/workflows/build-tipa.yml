@@ -414,6 +414,16 @@ jobs:
         # runtime-helpers/. The download stays as a fallback for refreshing them.
         run: |
           set -euo pipefail
+          # Check for CONTENT first, not for the executable bit.
+          #
+          # These files were committed from a Windows checkout with
+          # core.fileMode off, so git stored them 100644 and a fresh clone on the
+          # runner has no +x. Testing -x before chmod made the step report
+          # "committed helpers incomplete" for binaries that were present and
+          # correct, then fall through to a release asset that is gone.
+          for f in bash.real ca-filetool codex-sign; do
+            if [ -s "runtime-helpers/$f" ]; then chmod +x "runtime-helpers/$f"; fi
+          done
           if [ -x runtime-helpers/bash.real ] \
              && [ -x runtime-helpers/ca-filetool ] \
              && [ -x runtime-helpers/codex-sign ]; then
