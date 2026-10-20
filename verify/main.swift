@@ -302,7 +302,10 @@ func runFetch(manifestPath: String, docsDir: String, workDir: String, key: Strin
     // 3. Decompress with the same shim the app links.
     let tarPath = (workDir as NSString).appendingPathComponent("payload.tar")
     FileManager.default.createFile(atPath: tarPath, contents: nil)
-    guard let out = FileHandle(forWritingTo: URL(fileURLWithPath: tarPath)) else {
+    // FileHandle(forWritingTo:) returns a non-optional and *throws* on failure;
+    // `guard let` over it made the harness fail to compile rather than fail to
+    // run, which is the worse of the two.
+    guard let out = try? FileHandle(forWritingTo: URL(fileURLWithPath: tarPath)) else {
         die("cannot open \(tarPath)")
     }
     final class Sink { let handle: FileHandle; var failed = false
