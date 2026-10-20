@@ -527,12 +527,35 @@ jobs:
           mkdir -p "$APP/Helpers"
           cp -a runtime-helpers/. "$APP/Helpers/"
           chmod +x "$APP/Helpers/bash.real" "$APP/Helpers/ca-filetool" "$APP/Helpers/codex-sign"
+
+          # Recreate the multicall aliases.
+          #
+          # Only the three real binaries are committed, not the 30 symlinks that
+          # sat beside them, so they are rebuilt here. Every one of them points at
+          # ca-filetool, which dispatches on argv[0] to its own subcommands.
+          #
+          # `bash` is the exception and the reason this list is explicit rather
+          # than a loop over "everything in ca-filetool": bash is NOT a
+          # ca-filetool subcommand, it is the separate 811 KB bash.real image. An
+          # earlier build pointed Helpers/bash at ca-filetool, every spawn of the
+          # shell failed, and the failure was reported to the user as a missing
+          # entitlement.
+          for name in basename cat chmod date dirname du find grep head ln ls nl od \
+                      readlink realpath sed sh sort stat sysctl tail tee \
+                      theos-helper uname uniq wc which xxd bash-codex; do
+            ln -sf ca-filetool "$APP/Helpers/$name"
+          done
+          ln -sf bash.real "$APP/Helpers/bash"
+
           for link in "$APP/Helpers"/*; do
             [ -L "$link" ] || continue
-            target=$(readlink "$link")
-            echo "symlink $(basename "$link") -> $target"
+            echo "symlink $(basename "$link") -> $(readlink "$link")"
           done
-          test -x "$APP/Helpers/bash" || { echo "::error::Helpers/bash not resolvable"; exit 1; }
+          test -x "$APP/Helpers/bash"      || { echo "::error::Helpers/bash not resolvable"; exit 1; }
+          test -x "$APP/Helpers/bash.real" || { echo "::error::Helpers/bash.real missing"; exit 1; }
+          # The shell must be the real image, not the multicall binary.
+          test "$(readlink "$APP/Helpers/bash")" = "bash.real" \
+            || { echo "::error::Helpers/bash points at the multicall binary, not bash.real"; exit 1; }
 
           python3 scripts/make_tipa.py \
             --app "$APP" \
