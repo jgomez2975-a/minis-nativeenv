@@ -91,8 +91,49 @@ def parse_superblob(blob: bytes):
     return length, entries
 
 
+CPU_TYPE_ARM64 = 0x0100000C
+CPU_TYPE_ARM64_32 = 0x0200000C
+
+
+def fat_slice(data: bytes):
+    """
+    Return the arm64 slice of a universal binary, or None.
+
+    macOS system binaries are FAT; reading one as thin reports "not a Mach-O"
+    and made the ldid self-test fail for the wrong reason. The fat header is
+    big-endian, whatever the host byte order is.
+    """
+    if len(data) < 8:
+        return None
+    be_magic = int.from_bytes(data[0:4], "big")
+    if be_magic not in (0xCAFEBABE, 0xCAFEBABF):
+        return None
+
+    count = int.from_bytes(data[4:8], "big")
+    entry_size = 20 if be_magic == 0xCAFEBABE else 32
+    for i in range(count):
+        base = 8 + i * entry_size
+        if base + entry_size > len(data):
+            return None
+        cputype = int.from_bytes(data[base:base + 4], "big")
+        if be_magic == 0xCAFEBABE:
+            offset = int.from_bytes(data[base + 8:base + 12], "big")
+            size = int.from_bytes(data[base + 12:base + 16], "big")
+        else:
+            offset = int.from_bytes(data[base + 8:base + 16], "big")
+            size = int.from_bytes(data[base + 16:base + 24], "big")
+        if cputype in (CPU_TYPE_ARM64, CPU_TYPE_ARM64_32) and size:
+            return data[offset:offset + size]
+    return None
+
+
 def describe(name: str, data: bytes) -> bool:
-    """Print what the signature contains. Returns True if a CMS slot is present."""
+    """Print what the signature contains. Returns True if a usable CMS is present."""
+    sliced = fat_slice(data)
+    if sliced is not None:
+        # Probe the arm64 slice; the signature lives inside it.
+        data = sliced
+
     try:
         found = macho_code_signature(data)
     except ValueError as exc:
