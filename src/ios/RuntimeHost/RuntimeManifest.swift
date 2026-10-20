@@ -68,7 +68,43 @@ struct RuntimeSpec: Decodable {
     let assetName: String?
     let metadataURL: String?
 
-    let components: [String: String]?
+    let components: Components?
+
+    // NOTE: `components` is display-only and its shape is not uniform across
+    // runtimes — core_tools and node carry `{"git": "2.39.1"}`, reverse_tools
+    // and theos carry `{"go-macho": {"version": "v1.1.292"}}`. Declaring it
+    // `[String: String]` therefore threw a typeMismatch and took the entire
+    // manifest down: synthesised decoding treats an Optional as "may be absent",
+    // never as "may be a different shape". It is modelled as the union below so
+    // no future runtime can break decoding by nesting one level deeper.
+    enum Components: Decodable {
+        case versionStrings([String: String])
+        case objects([String: [String: String]])
+
+        init(from decoder: Decoder) throws {
+            let single = try decoder.singleValueContainer()
+            if let flat = try? single.decode([String: String].self) {
+                self = .versionStrings(flat)
+                return
+            }
+            if let nested = try? single.decode([String: [String: String]].self) {
+                self = .objects(nested)
+                return
+            }
+            // Anything else is a display concern, not a reason to fail an install.
+            self = .versionStrings([:])
+        }
+
+        /// Flattened `name -> version` view for the UI.
+        var versionMap: [String: String] {
+            switch self {
+            case .versionStrings(let flat):
+                return flat
+            case .objects(let nested):
+                return nested.compactMapValues { $0["version"] ?? $0["commit"] }
+            }
+        }
+    }
     let install: InstallInstructions?
 
     // Toolchain-specific version stamps — shown in the UI, never used for logic.
