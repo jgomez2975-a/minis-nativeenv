@@ -221,10 +221,30 @@ jobs:
       - name: Install build dependencies
         # meson arrives from the venv, not pip. Everything here is a native
         # build dependency the deps/ scripts call directly.
+        #
+        # `lld` is separate from `llvm` in Homebrew. iSH's VDSO step invokes
+        # `clang -target aarch64-linux-gnu -fuse-ld=lld`, and without ld.lld
+        # discoverable next to the clang that brew installed, clang fails with
+        # "invalid linker name in argument '-fuse-ld=lld'" before compiling a
+        # single object.
         run: |
           set -eu
-          brew install ninja llvm libarchive pkg-config go make || true
+          brew install ninja llvm libarchive pkg-config go make lld || true
           command -v meson && meson --version
+
+          LLVM_BIN="$(brew --prefix llvm)/bin"
+          LLD="$(command -v ld.lld || true)"
+          if [ -z "$LLD" ] && [ -x "$(brew --prefix lld)/bin/ld.lld" ]; then
+            LLD="$(brew --prefix lld)/bin/ld.lld"
+          fi
+          if [ -n "$LLD" ]; then
+            ln -sf "$LLD" "$LLVM_BIN/ld.lld"
+            echo "ld.lld -> $LLD"
+            "$LLVM_BIN/clang" --version | head -1
+          else
+            echo "::error::no ld.lld found; iSH VDSO will not link"
+            exit 1
+          fi
 
       - name: Install ldid
         # The .tipa is only installable if the main binary carries
