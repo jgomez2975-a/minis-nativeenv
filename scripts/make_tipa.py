@@ -120,19 +120,80 @@ def thin_binaries(app: Path) -> None:
 # ---------------------------------------------------------------------------
 
 class Signer:
-    def __init__(self) -> None:
-        # Prefer the Procursus build the CI installs. Homebrew also ships an
-        # `ldid` (2.1.5, saurik's original) whose output current `codesign`
-        # reports as "code object is not signed at all", so a bare `which ldid`
-        # can silently pick the wrong one.
-        self.ldid = None
-        for candidate in ("/usr/local/bin/ldid", which("ldid")):
-            if candidate and Path(candidate).exists():
-                self.ldid = candidate
-                break
+    """
+    Picks a signer that demonstrably works, rather than the first one on PATH.
+
+    Three candidates exist and they are not interchangeable:
+
+      * ldid 2.1.5 (Homebrew) — exits 0 while writing a signature that current
+        `codesign` reports as "code object is not signed at all".
+      * ProcursusTeam/ldid — the fork the TrollStore tooling uses, but its
+        current HEAD does not compile against OpenSSL 3.
+      * codesign — always present, always embeds the entitlements blob, no CMS.
+
+    So each candidate is tried on a throwaway copy of a real Mach-O, and one
+    that cannot put `platform-application` into a signature that reads back is
+    rejected here instead of 20 minutes into a build.
+    """
+
+    def __init__(self, entitlements: Path | None = None) -> None:
         self.codesign = which("codesign")
-        if not self.ldid and not self.codesign:
-            raise SystemExit("error: neither ldid nor codesign available")
+        self.entitlements = entitlements
+
+        candidates = []
+        for candidate in ("/usr/local/bin/ldid", which("ldid")):
+            if candidate and Path(candidate).exists() and candidate not in candidates:
+                candidates.append(candidate)
+
+        self.ldid = None
+        for candidate in candidates:
+            if self._verify(candidate, via_ldid=True):
+                self.ldid = candidate
+                print(f"  signer: ldid ({candidate})")
+                return
+            print(f"  rejected signer: {candidate} (signature does not read back)")
+
+        if self.codesign and self._verify(self.codesign, via_ldid=False):
+            print("  signer: codesign (ad-hoc, entitlements embedded)")
+            return
+        if self.codesign:
+            # Even without a readable read-back, codesign is the only remaining
+            # option; say so loudly rather than refusing to package.
+            print("  WARNING: codesign could not be verified; packaging anyway")
+            return
+
+        raise SystemExit("error: no working signer (tried ldid and codesign)")
+
+    def _verify(self, tool: str, via_ldid: bool) -> bool:
+        """Sign a temp copy and read the entitlement back. Cheapest real test."""
+        import tempfile
+
+        if not self.entitlements or not self.entitlements.exists():
+            return False
+        probe_src = Path("/bin/echo")
+        if not probe_src.exists():
+            return False
+
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                probe = Path(td) / "probe"
+                shutil.copy2(probe_src, probe)
+                if via_ldid:
+                    cmd = [tool, f"-S{self.entitlements}", str(probe)]
+                else:
+                    cmd = [tool, "--force", "--sign", "-", "--timestamp=none",
+                           "--entitlements", str(self.entitlements), str(probe)]
+                if subprocess.run(cmd, capture_output=True).returncode != 0:
+                    return False
+
+                dump = subprocess.run(
+                    [which("codesign") or "codesign", "-d", "--entitlements", ":-",
+                     str(probe)],
+                    capture_output=True, text=True,
+                    encoding="utf-8", errors="replace")
+                return "platform-application" in (dump.stdout + dump.stderr)
+        except Exception:
+            return False
 
     def sign(self, target: Path, entitlements: Path | None = None) -> None:
         if self.ldid:
@@ -276,7 +337,7 @@ def main() -> int:
         print("[3/6][4/6][5/6] signing/verify skipped (--skip-signing)")
     else:
         print("[3/6] signing nested code")
-        signer = Signer()
+        signer = Signer(args.entitlements.resolve())
         print(f"  signer: {'ldid' if signer.ldid else 'codesign (fallback)'}")
 
         print("[4/6] signing app with entitlements")
