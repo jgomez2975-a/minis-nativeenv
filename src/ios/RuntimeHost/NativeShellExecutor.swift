@@ -210,7 +210,7 @@ final class NativeShellExecutor {
             let reason = String(cString: strerror(code))
             throw NativeShellError.execUnavailable(
                 "posix_spawn(bash) failed: \(reason) (errno \(code)); "
-                + "helper=\(bundledBash ?? "<not found>")")
+                + "helper=\(Self.bundledBash ?? "<not found>")")
         }
 
         let started = Date()
