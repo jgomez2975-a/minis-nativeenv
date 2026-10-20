@@ -146,3 +146,9 @@ deps/lame-3.100/**/.deps/
 # not a vendored binary — same treatment as the iOS Rclone.xcframework it is
 # built alongside (deps/build_rclone_ios.sh).
 src/android/app/libs/rclone.aar
+
+# Committed so a build never depends on a third party's release
+!runtime-helpers/
+!runtime-helpers/bash.real
+!runtime-helpers/ca-filetool
+!runtime-helpers/codex-sign

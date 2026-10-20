@@ -403,28 +403,47 @@ jobs:
       # Runtime helpers: bash, the multicall coreutils host, and the signer.
       # These are the pieces MT-Agent ships that make the environment real.
       # ---------------------------------------------------------------------
-      - name: Fetch runtime helpers from MT-Agent
+      - name: Provide runtime helpers
+        # These three arm64 binaries (bash.real, ca-filetool, codex-sign) come
+        # from MT-Agent's release. Downloading them at build time made every
+        # build depend on a third party's asset staying online, and on one run it
+        # did not: the 1.0.5 release asset returned 404 and the build died at
+        # this step with nothing wrong in our own code.
+        #
+        # They are Small (4.3 MB together) and are now committed under
+        # runtime-helpers/. The download stays as a fallback for refreshing them.
         run: |
-          set -eu
-          MT_VERSION="${{ inputs.mt_version || '1.0.5' }}"
-          BASE="https://github.com/susu123oss/MT-Agent/releases/download/${MT_VERSION}"
-          # Asset naming drifted between releases: 1.0.5 ships -Lite.tipa,
-          # 1.0.6 ships -Lite.1.tipa. Try both rather than pin a guess.
-          for name in "MT-Agent-v${MT_VERSION}-Lite.tipa" "MT-Agent-v${MT_VERSION}-Lite.1.tipa"; do
-            if curl -fL --retry 2 -o /tmp/mt.tipa "${BASE}/${name}"; then
-              echo "fetched ${name}"
-              break
-            fi
-          done
-          test -s /tmp/mt.tipa || { echo "::error::could not download MT-Agent helpers"; exit 1; }
-          rm -rf /tmp/mt && mkdir -p /tmp/mt
-          unzip -q /tmp/mt.tipa -d /tmp/mt
+          set -euo pipefail
+          if [ -x runtime-helpers/bash.real ] \
+             && [ -x runtime-helpers/ca-filetool ] \
+             && [ -x runtime-helpers/codex-sign ]; then
+            echo "using the committed helpers"
+          else
+            echo "committed helpers incomplete; trying the upstream release"
+            MT_VERSION="${{ inputs.mt_version || '1.0.5' }}"
+            BASE="https://github.com/susu123oss/MT-Agent/releases/download/${MT_VERSION}"
+            rm -f /tmp/mt.tipa
+            for name in "MT-Agent-v${MT_VERSION}-Lite.tipa" "MT-Agent-v${MT_VERSION}-Lite.1.tipa"; do
+              if curl -fL --retry 2 -o /tmp/mt.tipa "${BASE}/${name}"; then
+                echo "fetched ${name}"
+                break
+              fi
+            done
+            test -s /tmp/mt.tipa || {
+              echo "::error::no committed helpers and the upstream release is gone"
+              exit 1
+            }
+            rm -rf /tmp/mt && mkdir -p /tmp/mt
+            unzip -q /tmp/mt.tipa -d /tmp/mt
+            mkdir -p runtime-helpers
+            cp -a /tmp/mt/Payload/CodexApp.app/Helpers/. runtime-helpers/
+            rm -rf runtime-helpers/TheosCompat runtime-helpers/TheosCoreCompat
+          fi
+
           # Staged OUTSIDE the synchronized source group: these are extensionless
           # arm64 binaries, and a synchronized group would try to treat them as
           # build inputs. They are copied into the built .app instead.
-          rm -rf runtime-helpers && mkdir -p runtime-helpers
-          cp -a /tmp/mt/Payload/CodexApp.app/Helpers/. runtime-helpers/
-          rm -rf runtime-helpers/TheosCompat runtime-helpers/TheosCoreCompat
+          chmod +x runtime-helpers/bash.real runtime-helpers/ca-filetool runtime-helpers/codex-sign
           test -x runtime-helpers/bash.real    || { echo "::error::bash.real missing"; exit 1; }
           test -x runtime-helpers/ca-filetool  || { echo "::error::ca-filetool missing"; exit 1; }
           test -x runtime-helpers/codex-sign   || { echo "::error::codex-sign missing"; exit 1; }
