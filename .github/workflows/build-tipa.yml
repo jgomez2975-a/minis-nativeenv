@@ -87,19 +87,38 @@ jobs:
         # reported the same thing 35 minutes later, after building iSH, FFmpeg
         # and rclone.
         run: |
-          set -eu
+          set -euo pipefail
+          GRAFT=(
+            src/ios/RuntimeHost/RuntimePaths.swift
+            src/ios/RuntimeHost/RuntimeManifest.swift
+            src/ios/RuntimeHost/RuntimePlan.swift
+            src/ios/RuntimeHost/RuntimeTar.swift
+            src/ios/RuntimeHost/RuntimeInstaller.swift
+            src/ios/RuntimeHost/NativeShellExecutor.swift
+            src/ios/RuntimeHost/NativeShellBackend.swift
+            verify/stubs/AppLogger.swift
+            verify/stubs/ISHCommandResult.swift
+          )
+
+          # Pass 1 — host, which is also where the verify binary comes from.
           swiftc -typecheck \
             -import-objc-header src/ios/RuntimeHost/RuntimeArchive.h \
-            src/ios/RuntimeHost/RuntimePaths.swift \
-            src/ios/RuntimeHost/RuntimeManifest.swift \
-            src/ios/RuntimeHost/RuntimePlan.swift \
-            src/ios/RuntimeHost/RuntimeTar.swift \
-            src/ios/RuntimeHost/RuntimeInstaller.swift \
-            src/ios/RuntimeHost/NativeShellExecutor.swift \
-            src/ios/RuntimeHost/NativeShellBackend.swift \
-            verify/stubs/AppLogger.swift \
-            verify/stubs/ISHCommandResult.swift
-          echo "::notice::all 7 graft files type-check"
+            "${GRAFT[@]}"
+          echo "host type-check: ok"
+
+          # Pass 2 — against the real iOS SDK. Not redundant: posix_spawn's
+          # addchdir_np is merely deprecated on macOS but explicitly unavailable
+          # on iOS, so a host-only check passed while xcodebuild failed. The
+          # 16.0 deployment target is the strictest the project contains, so
+          # availability problems surface here rather than 11 minutes into a
+          # device build.
+          IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          swiftc -typecheck \
+            -sdk "$IOS_SDK" \
+            -target arm64-apple-ios16.0 \
+            -import-objc-header src/ios/RuntimeHost/RuntimeArchive.h \
+            "${GRAFT[@]}"
+          echo "::notice::all 7 graft files type-check for host and for iOS"
 
       - name: Verify the decoder against the live documents
         # Compiles the Foundation-only files with the host swiftc and runs the
@@ -364,9 +383,11 @@ jobs:
         # app id alone leaves the extensions pointing at a parent that no longer
         # exists and the embed phase fails validation.
         run: |
-          set -eu
-          # DEPLOYMENT_OVERRIDE is empty unless the runner's SDK is older than
-          # the project's pinned target; see the Toolchain versions step.
+          set -euo pipefail
+          # pipefail is not decoration: without it the exit status of
+          # `xcodebuild | tee | tail` is tail's, so a failed compile looked like
+          # a success and the packaging step then found a half-written .app with
+          # no Info.plist.
           xcodebuild \
             -project src/ios/Minis.xcodeproj \
             -scheme Minis \
@@ -378,12 +399,18 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             ONLY_ACTIVE_ARCH=NO \
             ${DEPLOYMENT_OVERRIDE:-} \
-            build | tee build/xcodebuild.log | tail -60
+            build 2>&1 | tee build/xcodebuild.log | tail -60
 
           APP=$(find build/DD/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
-          test -n "$APP" || { echo "::error::no .app produced"; grep -iE "error:" build/xcodebuild.log | head -20; exit 1; }
+          test -n "$APP" || { echo "::error::no .app produced"; exit 1; }
+          test -f "$APP/Info.plist" || {
+            echo "::error::$APP has no Info.plist — the build did not complete"
+            ls -la "$APP" | head -30
+            exit 1
+          }
           echo "APP=$APP" >> $GITHUB_ENV
           echo "built: $APP"
+          du -sh "$APP"
           df -h /Users/runner | tail -1
 
       - name: Package .tipa

@@ -756,15 +756,28 @@ actor RuntimeInstaller {
         guard fileManager.isExecutableFile(atPath: exe.path) else {
             throw InstallerError.probeFailed(probe.executable, "not executable at \(exe.path)")
         }
+        guard let bash = NativeShellExecutor.bundledBash else {
+            throw InstallerError.probeFailed(probe.executable,
+                                             "Helpers/bash missing from the bundle")
+        }
         var env = shellEnvironment()
         env["RUNTIME_ROOT"] = root.path
 
-        let result = try NativeShellExecutor.shared.run(
-            executable: exe.path,
-            arguments: probe.arguments,
+        // Run through bash so the working directory travels as part of the
+        // command. Some probes are cwd-relative — node's does
+        // require('./lib/node_modules/…') — so dropping the cwd silently turns a
+        // working probe into a failing one.
+        let command = "cd \(NativeShellExecutor.shellQuote(root.path)) && exec "
+            + ([exe.path] + probe.arguments).map(NativeShellExecutor.shellQuote)
+                .joined(separator: " ")
+
+        let result = try NativeShellExecutor.shared.runShell(
+            command: command,
+            bashPath: bash,
             environment: env,
-            currentDirectory: root.path,
-            timeout: 90)
+            timeout: 90,
+            onLine: nil,
+            onPID: nil)
 
         let combined = result.output + result.errorOutput
         guard combined.contains(probe.contains) else {

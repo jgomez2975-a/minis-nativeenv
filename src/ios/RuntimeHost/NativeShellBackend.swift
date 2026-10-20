@@ -163,13 +163,16 @@ actor NativeShellBackend {
 
         let mirror = StringBuilder(limit: maxOutputChars)
 
+        // The cwd is prepended to the command rather than set as a spawn
+        // attribute: the attribute API is unavailable on iOS (see NativeShellExecutor).
+        let wrapped = "cd \(NativeShellExecutor.shellQuote(cwd)) && " + command
+
         let result: NativeShellResult
         do {
             result = try NativeShellExecutor.shared.run(
                 executable: bash,
-                arguments: ["-lc", command],
+                arguments: ["-lc", wrapped],
                 environment: env,
-                currentDirectory: cwd,
                 stdinData: nil,
                 timeout: timeout ?? 600,
                 onLine: { line, isStdErr in

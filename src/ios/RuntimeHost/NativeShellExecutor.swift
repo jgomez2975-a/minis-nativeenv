@@ -77,6 +77,21 @@ final class NativeShellExecutor {
 
     // MARK: - Capability probe
 
+    /// The bash that ships in the bundle, or nil.
+    static var bundledBash: String? {
+        for candidate in ["Helpers/bash", "Helpers/bash.real"] {
+            let url = Bundle.main.bundleURL.appendingPathComponent(candidate)
+            if FileManager.default.isExecutableFile(atPath: url.path) { return url.path }
+        }
+        return nil
+    }
+
+    /// Single-quote a string for the shell. Used wherever a working directory
+    /// has to be expressed as a command rather than as a spawn attribute.
+    static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     /// Result of the one-time exec probe, or nil before the first call.
     ///
     /// Deliberately not `lazy var`: the singleton is reached from the main
@@ -116,11 +131,7 @@ final class NativeShellExecutor {
     }
 
     private static func probeNativeExec() -> (Bool, Int32) {
-        let candidates = ["Helpers/bash", "Helpers/bash.real"]
-        guard let bash = candidates
-            .map({ Bundle.main.bundleURL.appendingPathComponent($0) })
-            .first(where: { FileManager.default.isExecutableFile(atPath: $0.path) })
-        else {
+        guard let bash = bundledBash else {
             cachedProbeErrno = ENOENT
             return (false, ENOENT)
         }
@@ -160,11 +171,17 @@ final class NativeShellExecutor {
 
     /// Synchronous spawn. Call from a background queue or a detached Task — this
     /// blocks the caller until the child exits or the timeout fires.
+    ///
+    /// No working-directory parameter on purpose. `posix_spawn_file_actions_addchdir_np`
+    /// is marked unavailable in the iOS SDK (it survives only as a deprecated
+    /// macOS symbol), and the non-`_np` replacement is newer than this app's
+    /// deployment target. Callers that need a cwd go through `runShell`, which
+    /// prepends an explicit `cd` — one code path, no unavailable symbols, and
+    /// the failure mode is a normal shell error rather than a link error.
     func run(
         executable: String,
         arguments: [String] = [],
         environment: [String: String],
-        currentDirectory: String? = nil,
         stdinData: Data? = nil,
         timeout: TimeInterval? = nil,
         onLine: ((String, Bool) -> Void)? = nil,
@@ -207,10 +224,6 @@ final class NativeShellExecutor {
         } else {
             posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
         }
-        if let cwd = currentDirectory {
-            posix_spawn_file_actions_addchdir_np(&fileActions, cwd)
-        }
-
         var attr: posix_spawnattr_t?
         posix_spawnattr_init(&attr)
         defer { posix_spawnattr_destroy(&attr) }
@@ -375,12 +388,14 @@ final class NativeShellExecutor {
         )
     }
 
-    /// Fire-and-forget shell: `sh -c <command>` against the bundled bash.
+    /// Fire-and-forget shell: `<bash> -lc <command>`.
+    ///
+    /// This is the only spawn path that can set a working directory, and it does
+    /// so by making the directory part of the command.
     func runShell(
         command: String,
         bashPath: String,
         environment: [String: String],
-        currentDirectory: String?,
         timeout: TimeInterval?,
         onLine: ((String, Bool) -> Void)?,
         onPID: ((pid_t) -> Void)?
@@ -388,7 +403,6 @@ final class NativeShellExecutor {
         try run(executable: bashPath,
                 arguments: ["-lc", command],
                 environment: environment,
-                currentDirectory: currentDirectory,
                 stdinData: nil,
                 timeout: timeout,
                 onLine: onLine,
