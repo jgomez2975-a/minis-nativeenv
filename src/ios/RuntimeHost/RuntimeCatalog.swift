@@ -93,6 +93,12 @@ final class RuntimeCatalog: ObservableObject {
     @Published private(set) var nativeExecAvailable = false
     @Published private(set) var nativeExecReason = ""
 
+    /// One line describing where the installer is working and where the manifest
+    /// came from, shown in the panel's footer. A screenshot of it answers the
+    /// questions that otherwise cost a round trip: did exec survive, which root
+    /// is in use, did the manifest load at all.
+    @Published private(set) var diagnostics = ""
+
     private let paths = RuntimePaths.resolve()
     private lazy var installer = RuntimeInstaller(paths: paths)
 
