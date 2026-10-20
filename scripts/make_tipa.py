@@ -165,9 +165,17 @@ class Signer:
         else:
             raise SystemExit("error: no signer available (need ldid or codesign)")
 
-    def sign(self, target: Path, entitlements: Path | None = None) -> None:
+    def sign(self, target: Path, entitlements: Path | None = None,
+             identifier: str | None = None) -> None:
         if self.ldid:
             cmd = [self.ldid]
+            # ldid derives the CodeDirectory identifier from the binary name
+            # unless told otherwise, so a binary called `Minis` gets an
+            # identifier of "Minis" instead of the bundle id. Passing -I only
+            # alongside -S is safe: without -S ldid takes -I to mean "extract
+            # the identifier", which is not what this is.
+            if identifier:
+                cmd.append(f"-I{identifier}")
             cmd.append(f"-S{entitlements}" if entitlements else "-S")
             cmd.append(str(target))
         else:
@@ -207,8 +215,9 @@ def sign_bundle(app: Path, entitlements: Path, signer: Signer) -> None:
     # Main binary last, with the platform entitlements.
     info = plistlib.loads((app / "Info.plist").read_bytes())
     main_binary = app / info["CFBundleExecutable"]
-    signer.sign(main_binary, entitlements)
-    print(f"  signed {main_binary.relative_to(app)} (with entitlements)")
+    signer.sign(main_binary, entitlements, identifier=info.get("CFBundleIdentifier"))
+    print(f"  signed {main_binary.relative_to(app)} (with entitlements, "
+          f"id={info.get('CFBundleIdentifier')})")
 
 
 # ---------------------------------------------------------------------------
