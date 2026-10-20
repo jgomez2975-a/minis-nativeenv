@@ -401,11 +401,15 @@ jobs:
             ${DEPLOYMENT_OVERRIDE:-} \
             build 2>&1 | tee build/xcodebuild.log | tail -60
 
-          APP=$(find build/DD/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          # `find -print -quit`, not `find | head -1`. Under pipefail the pipe
+          # reports SIGPIPE from find (141) and `set -e` kills the step with no
+          # output at all — which is exactly how a successful build ended up
+          # looking like a failure.
+          APP=$(find build/DD/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" -print -quit)
           test -n "$APP" || { echo "::error::no .app produced"; exit 1; }
           test -f "$APP/Info.plist" || {
             echo "::error::$APP has no Info.plist — the build did not complete"
-            ls -la "$APP" | head -30
+            ls -1 "$APP" | sed -n '1,30p'
             exit 1
           }
           echo "APP=$APP" >> $GITHUB_ENV
