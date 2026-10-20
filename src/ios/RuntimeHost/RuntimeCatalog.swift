@@ -108,11 +108,14 @@ final class RuntimeCatalog: ObservableObject {
             : AppLocalized("缺少 platform-application 权限,原生执行不可用")
 
         var manifest: RuntimeManifest?
+        var source = "network"
         do {
             manifest = try await installer.loadManifest()
         } catch {
             lastError = AppLocalized("清单加载失败") + ": " + error.localizedDescription
             items = []
+            diagnostics = Self.describe(available: nativeExecAvailable,
+                                        source: "unavailable", count: 0)
             return
         }
         guard let manifest else { return }
@@ -136,6 +139,9 @@ final class RuntimeCatalog: ObservableObject {
         }
         items = built
 
+        diagnostics = Self.describe(available: nativeExecAvailable,
+                                    source: source, count: built.count)
+
         // Republish the model-facing environment description. Without this the
         // shell tool keeps describing whatever was installed the last time an
         // install ran — including "nothing installed" for a device that adopted
@@ -144,6 +150,18 @@ final class RuntimeCatalog: ObservableObject {
     }
 
     // MARK: - Actions
+
+    /// One line that a screenshot can carry. Answers the three questions that
+    /// otherwise cost a round trip: is exec actually available, where is the
+    /// installer writing, and did the manifest come from the network.
+    private static func describe(available: Bool, source: String, count: Int) -> String {
+        var parts: [String] = []
+        parts.append("exec:" + (available ? "native" : "iSH(\(NativeShellExecutor.shared.probeErrno))"))
+        parts.append("manifest:" + source)
+        parts.append("runtimes:" + "\(count)")
+        parts.append("root:" + (RuntimePaths.resolve().isShared ? "shared" : "container"))
+        return parts.joined(separator: " · ")
+    }
 
     func install(_ key: String) async {
         guard busyKey == nil else { return }

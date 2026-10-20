@@ -62,7 +62,14 @@ struct DevCapabilitiesView: View {
             Section {
                 EmptyView()
             } footer: {
-                Text(AppLocalized("工具链装在设备上,装一次长期可用。全部装完约 1.3 GB;Theos 最大,约 980 MB。"))
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(AppLocalized("工具链装在设备上,装一次长期可用。全部装完约 1.3 GB;Theos 最大,约 980 MB。"))
+                    if !model.diagnostics.isEmpty {
+                        Text(model.diagnostics)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
         }
         .navigationTitle(AppLocalized("开发能力"))

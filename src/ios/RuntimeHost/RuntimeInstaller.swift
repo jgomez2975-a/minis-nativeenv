@@ -30,6 +30,7 @@ private let log = AppLogger(category: "RuntimeInstaller")
 
 enum InstallerError: Error, LocalizedError {
     case manifestUnavailable
+    case networkFailed(String)
     case downloadFailed(String, Int)
     case checksumMismatch(expected: String, actual: String)
     case unsupportedArchive(String)
@@ -43,6 +44,8 @@ enum InstallerError: Error, LocalizedError {
         switch self {
         case .manifestUnavailable:
             return "runtime manifest could not be loaded"
+        case .networkFailed(let detail):
+            return "网络请求全部失败: " + detail
         case .downloadFailed(let url, let code):
             return "download failed (\(code)): \(url)"
         case .checksumMismatch(let e, let a):
@@ -87,7 +90,10 @@ actor RuntimeInstaller {
         // fetch is preferred because a stale manifest pins dead release URLs.
         let cache = paths.root.appendingPathComponent("manifest.json")
         do {
-            let (data, _) = try await URLSession.shared.data(from: Self.manifestURL)
+            // The manifest cannot describe its own proxies before it is loaded,
+            // so the built-in pair is used for this first request.
+            let data = try await fetchData(from: Self.manifestURL.absoluteString,
+                                           proxies: Self.defaultProxyPrefixes)
             let parsed = try JSONDecoder().decode(RuntimeManifest.self, from: data)
             try? data.write(to: cache, options: .atomic)
             manifest = parsed
@@ -99,8 +105,67 @@ actor RuntimeInstaller {
                 manifest = parsed
                 return parsed
             }
-            throw InstallerError.manifestUnavailable
+            throw error
         }
+    }
+
+    // MARK: - Networking
+
+    /// Proxy prefixes used when a direct GitHub request fails.
+    ///
+    /// These are the two the runtime project publishes in its own manifest, and
+    /// they exist because raw.githubusercontent.com and github.com/…/releases
+    /// are routinely unreachable from mainland networks. Using them only for the
+    /// archive download left the manifest fetch — the one request everything
+    /// else depends on — with no fallback at all.
+    static let defaultProxyPrefixes = [
+        "https://gh-proxy.org/",
+        "https://ghproxy.net/",
+    ]
+
+    func proxyPrefixes() -> [String] {
+        var merged = Self.defaultProxyPrefixes
+        for prefix in manifest?.downloadProxyPrefixes ?? [] where !merged.contains(prefix) {
+            merged.append(prefix)
+        }
+        return merged
+    }
+
+    /// Direct first, then each proxy. Reports every URL tried when all fail,
+    /// because "network error" with no host in it is unactionable from a device.
+    func fetchData(from urlString: String,
+                   proxies: [String]? = nil,
+                   timeout: TimeInterval = 25) async throws -> Data {
+        var candidates = [urlString]
+        for prefix in (proxies ?? proxyPrefixes()) {
+            candidates.append(prefix + urlString)
+        }
+
+        var attempts: [String] = []
+        for candidate in candidates {
+            guard let url = URL(string: candidate) else { continue }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = timeout
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                    attempts.append("HTTP \(http.statusCode) \(url.host ?? "-")")
+                    continue
+                }
+                if data.isEmpty {
+                    attempts.append("empty \(url.host ?? "-")")
+                    continue
+                }
+                if candidate != urlString {
+                    log.info("proxy succeeded: \(url.host ?? "-")")
+                }
+                return data
+            } catch {
+                attempts.append("\(url.host ?? "-"): \(error.localizedDescription)")
+            }
+        }
+        throw InstallerError.networkFailed(attempts.joined(separator: " | "))
     }
 
     /// Everything Minis can use, in display order. `codex` is excluded: it is
@@ -401,11 +466,10 @@ actor RuntimeInstaller {
            let decoded = try? JSONDecoder().decode(RuntimeBundle.self, from: data) {
             return decoded
         }
-        guard let urlString = spec.metadataURL, let url = URL(string: urlString) else { return nil }
+        guard let urlString = spec.metadataURL else { return nil }
         do {
-            let (data, response) = try await URLSession.shared.data(from: url)
-            guard (response as? HTTPURLResponse)?.statusCode == 200,
-                  let decoded = try? JSONDecoder().decode(RuntimeBundle.self, from: data)
+            let data = try await fetchData(from: urlString)
+            guard let decoded = try? JSONDecoder().decode(RuntimeBundle.self, from: data)
             else { return nil }
             try? fileManager.createDirectory(at: paths.cacheDir, withIntermediateDirectories: true)
             try? data.write(to: cache, options: .atomic)
@@ -450,29 +514,34 @@ actor RuntimeInstaller {
         // deleted there, so the next attempt re-downloads.
         if fileManager.fileExists(atPath: destination.path) { return destination }
 
-        guard let primary = URL(string: spec.archiveURL) else {
-            throw InstallerError.downloadFailed(spec.archiveURL, 0)
+        // Direct first, then the same proxy prefixes the manifest and descriptor
+        // fetches use. The archive is the largest request of the three and the
+        // one most likely to be blocked, so it must not be the only one with a
+        // fallback reversed.
+        var candidates: [URL] = []
+        if let primary = URL(string: spec.archiveURL) { candidates.append(primary) }
+        for prefix in proxyPrefixes() {
+            if let proxied = URL(string: prefix + spec.archiveURL) { candidates.append(proxied) }
         }
 
-        var candidates: [URL] = [primary]
-        if let m = manifest {
-            for prefix in m.downloadProxyPrefixes {
-                if let proxied = URL(string: prefix + spec.archiveURL) { candidates.append(proxied) }
-            }
-        }
-
-        var lastCode = 0
+        var attempts: [String] = []
         for url in candidates {
             do {
                 let tmp = try await download(url: url, progress: progress)
                 try fileManager.moveItem(at: tmp, to: destination)
                 return destination
             } catch let error as InstallerError {
-                if case .downloadFailed(_, let code) = error { lastCode = code }
+                if case .downloadFailed(_, let code) = error {
+                    attempts.append("HTTP \(code) \(url.host ?? "-")")
+                }
+                continue
+            } catch {
+                attempts.append("\(url.host ?? "-"): \(error.localizedDescription)")
                 continue
             }
         }
-        throw InstallerError.downloadFailed(spec.archiveURL, lastCode)
+        throw InstallerError.networkFailed(
+            "archive: " + (attempts.joined(separator: " | ")))
     }
 
     private func download(
