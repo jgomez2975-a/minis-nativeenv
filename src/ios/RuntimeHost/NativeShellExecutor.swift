@@ -35,6 +35,7 @@ private let log = AppLogger(category: "NativeShell")
 enum NativeShellError: Error, LocalizedError {
     case execUnavailable(String)
     case spawnFailed(Int32)
+    case waitFailed(Int32)
     case chdirFailed(Int32)
     case cancelled
     case timedOut(partialOutput: String, err: String, seconds: TimeInterval)
@@ -43,6 +44,7 @@ enum NativeShellError: Error, LocalizedError {
         switch self {
         case .execUnavailable(let why): return "native exec unavailable: \(why)"
         case .spawnFailed(let e): return "posix_spawn failed: \(String(cString: strerror(e)))"
+        case .waitFailed(let e): return "waitpid failed: \(String(cString: strerror(e)))"
         case .chdirFailed(let e): return "chdir failed: \(String(cString: strerror(e)))"
         case .cancelled: return "cancelled"
         case .timedOut(_, _, let s): return "timed out after \(Int(s))s"
@@ -280,15 +282,20 @@ final class NativeShellExecutor {
         // restructure for partial lines; threads keep the line assembler dumb.
         let collector = LineCollector(onLine: onLine)
         let group = DispatchGroup()
+        let control = DrainControl()
 
         group.enter()
         DispatchQueue.global(qos: .userInitiated).async {
-            Self.drain(fd: outPipe[0]) { chunk in collector.append(chunk, isStdErr: false) }
+            Self.drain(fd: outPipe[0], control: control) { chunk in
+                collector.append(chunk, isStdErr: false)
+            }
             group.leave()
         }
         group.enter()
         DispatchQueue.global(qos: .userInitiated).async {
-            Self.drain(fd: errPipe[0]) { chunk in collector.append(chunk, isStdErr: true) }
+            Self.drain(fd: errPipe[0], control: control) { chunk in
+                collector.append(chunk, isStdErr: true)
+            }
             group.leave()
         }
 
@@ -305,17 +312,43 @@ final class NativeShellExecutor {
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: work)
         }
 
+        // waitpid failing is not "exit code 0". ECHILD means the child was reaped
+        // elsewhere; without this flag the status stays zero-initialised and a
+        // failed wait reads as a clean success.
         var status: Int32 = 0
-        while waitpid(pid, &status, 0) == -1 && errno == EINTR { continue }
+        var waitError: Int32 = 0
+        while true {
+            let reaped = waitpid(pid, &status, 0)
+            if reaped == pid { break }
+            if reaped == -1 && errno == EINTR { continue }
+            waitError = errno
+            break
+        }
         timerWork?.cancel()
 
-        group.wait()   // both readers hit EOF now that every writer is gone
+        if waitError != 0 {
+            // Nothing to reap; make sure the group is not left running.
+            Self.signalGroup(pid, SIGKILL)
+        }
+
+        // Give the readers a moment to hit EOF, then stop them. A backgrounded
+        // grandchild keeps the pipe open forever, and waiting on it would hang
+        // the caller for the life of the process.
+        if group.wait(timeout: .now() + 2.0) == .timedOut {
+            control.stop()
+            _ = group.wait(timeout: .now() + 1.0)
+            log.debug("pipe still open after exit of \(pid); drained what arrived")
+        }
         collector.flush()
 
         stateLock.lock()
         live.removeValue(forKey: pid)
         let wasCancelled = cancelledPids.remove(pid) != nil
         stateLock.unlock()
+
+        if waitError != 0 {
+            throw NativeShellError.waitFailed(waitError)
+        }
 
         let duration = Date().timeIntervalSince(started)
         let exitCode: Int32 = (status & 0x7F) == 0 ? ((status >> 8) & 0xFF) : -1
@@ -394,9 +427,43 @@ final class NativeShellExecutor {
 
     // MARK: - Plumbing
 
-    private static func drain(fd: Int32, onChunk: @escaping (UnsafePointer<UInt8>, Int) -> Void) {
+    /// Lets the caller tell a blocked reader to give up.
+    ///
+    /// Needed because EOF is not guaranteed: a command that backgrounds anything
+    /// (`npm run dev &`, a daemon, a spawned server) leaves a grandchild holding
+    /// the write end of our pipe. The child we waitpid'd is gone, so nothing will
+    /// ever close that end, and a plain `group.wait()` blocks for the life of the
+    /// app. Closing the read fd from another thread is not a fix either — the
+    /// reader may already be blocked in read(2), and the fd number can be reused
+    /// underneath it. A poll with a timeout plus this flag is boring and correct.
+    private final class DrainControl {
+        private let lock = NSLock()
+        private var stopped = false
+
+        func stop() {
+            lock.lock(); stopped = true; lock.unlock()
+        }
+
+        var shouldStop: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return stopped
+        }
+    }
+
+    private static func drain(fd: Int32,
+                              control: DrainControl,
+                              onChunk: @escaping (UnsafePointer<UInt8>, Int) -> Void) {
         var buf = [UInt8](repeating: 0, count: 8192)
-        while true {
+        var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+
+        while !control.shouldStop {
+            let ready = poll(&descriptor, 1, 250)
+            if ready < 0 {
+                if errno == EINTR { continue }
+                break
+            }
+            if ready == 0 { continue } // timeout — re-check the stop flag
+
             let n = buf.withUnsafeMutableBytes { raw -> Int in
                 guard let base = raw.baseAddress else { return -1 }
                 return read(fd, base, raw.count)
@@ -406,7 +473,7 @@ final class NativeShellExecutor {
                     if let base = p.baseAddress { onChunk(base, n) }
                 }
             } else if n == 0 {
-                break
+                break          // real EOF: every writer closed
             } else if errno == EINTR {
                 continue
             } else {
