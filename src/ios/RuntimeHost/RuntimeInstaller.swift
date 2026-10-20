@@ -425,15 +425,83 @@ actor RuntimeInstaller {
             for (k, v) in plan.environment {
                 env[k] = expand(v, root: root).path
             }
-            if plan.key.lowercased().contains("theos") {
-                let nested = root.appendingPathComponent("theos")
-                let theosRoot = FileManager.default.fileExists(atPath: nested.path)
-                    ? nested : root
-                env["THEOS"] = theosRoot.path
+        }
+
+        applyTheosEnvironment(&env, plans: plans)
+
+        return env
+    }
+
+    /// The Theos variables the on-device build path actually reads.
+    ///
+    /// MT-Agent injects a dozen `CA_THEOS_*` values because its own system
+    /// prompt tells the model to trust them and never to guess
+    /// /usr/bin/make, /usr/bin/ldid or an SDK path. Setting only `THEOS` — as an
+    /// earlier revision did — leaves `make package` to discover the toolchain by
+    /// convention on a filesystem where none of those conventions hold.
+    ///
+    /// Every value is set only when the file it names exists. The Theos payload
+    /// ships `usr/bin/{make,ldid,dpkg-deb,perl,ar,as,lipo,ld64,strip,tar,gzip,xz}`
+    /// but no clang: the compiler comes from the separate OLLVM runtime, so
+    /// `CA_THEOS_CLANG` is resolved across runtimes rather than within Theos.
+    private func applyTheosEnvironment(_ env: inout [String: String],
+                                       plans: [(RuntimePlan, URL)]) {
+        guard let theos = plans.first(where: { $0.0.key.lowercased().contains("theos") })
+        else { return }
+        let root = theos.1
+        let fm = FileManager.default
+
+        func bind(_ variable: String, _ relative: String) {
+            let url = root.appendingPathComponent(relative)
+            if fm.fileExists(atPath: url.path) { env[variable] = url.path }
+        }
+
+        let nested = root.appendingPathComponent("theos")
+        env["THEOS"] = fm.fileExists(atPath: nested.path) ? nested.path : root.path
+        env["CA_THEOS_RUNTIME"] = root.path
+        bind("CA_THEOS_MAKE", "usr/bin/make")
+        bind("CA_THEOS_LDID", "usr/bin/ldid")
+        bind("CA_THEOS_DPKG_DEB", "usr/bin/dpkg-deb")
+        bind("CA_THEOS_PERL", "usr/bin/perl")
+        bind("CA_THEOS_PATH", "usr/bin")
+        bind("CA_THEOS_TAR", "usr/bin/tar")
+        bind("CA_THEOS_GZIP", "usr/bin/gzip")
+        bind("CA_THEOS_XZ", "usr/bin/xz")
+
+        if let sdk = env["CA_THEOS_SDK"] ?? theos.0.environment["CA_THEOS_SDK"] {
+            env["CA_THEOS_SDKROOT"] = sdk
+        } else if let sdkName = manifest?.runtimes[theos.0.key]?.sdk {
+            for candidate in ["sdks/\(sdkName)", sdkName] {
+                let url = root.appendingPathComponent(candidate)
+                if fm.fileExists(atPath: url.path) {
+                    env["CA_THEOS_SDKROOT"] = url.path
+                    break
+                }
             }
         }
 
-        return env
+        // theos-helper drives the forkless packaging path; without it Theos
+        // falls back to fakeroot/dm.pl, which the payload does not carry.
+        let helper = Bundle.main.bundleURL.appendingPathComponent("Helpers/theos-helper")
+        if fm.isExecutableFile(atPath: helper.path) {
+            env["CA_THEOS_HELPER"] = helper.path
+            env["CA_THEOS_PACKAGE_MODE"] = "forkless"
+        }
+
+        // clang lives in the OLLVM runtime, not in Theos.
+        if let ollvm = plans.first(where: { $0.0.key.lowercased().contains("ollvm") }) {
+            let clang = ollvm.1.appendingPathComponent("bin/clang")
+            if fm.isExecutableFile(atPath: clang.path) {
+                env["CA_THEOS_CLANG"] = clang.path
+                let clangxx = ollvm.1.appendingPathComponent("bin/clang++")
+                if fm.isExecutableFile(atPath: clangxx.path) {
+                    env["CA_THEOS_CLANGXX"] = clangxx.path
+                }
+            }
+        }
+        if env["CA_THEOS_CLANG"] == nil {
+            log.warning("Theos is installed but OLLVM is not; CA_THEOS_CLANG unset")
+        }
     }
 
     /// Synchronous manifest read for the paths that cannot await.
