@@ -77,6 +77,30 @@ jobs:
           python3 scripts/preflight.py --repo .
           echo "::notice::preflight passed"
 
+      - name: Type-check the whole graft
+        # Preflight proves the sources parse; only the compiler proves they type
+        # check. This runs every graft file through swiftc with the real C
+        # header bridged in and stubs for the two Minis types it touches.
+        #
+        # It exists because the first run found `Data().write(to:atomically:)` —
+        # an overload that does not exist — in RuntimeTar. xcodebuild would have
+        # reported the same thing 35 minutes later, after building iSH, FFmpeg
+        # and rclone.
+        run: |
+          set -eu
+          swiftc -typecheck \
+            -import-objc-header src/ios/RuntimeHost/RuntimeArchive.h \
+            src/ios/RuntimeHost/RuntimePaths.swift \
+            src/ios/RuntimeHost/RuntimeManifest.swift \
+            src/ios/RuntimeHost/RuntimePlan.swift \
+            src/ios/RuntimeHost/RuntimeTar.swift \
+            src/ios/RuntimeHost/RuntimeInstaller.swift \
+            src/ios/RuntimeHost/NativeShellExecutor.swift \
+            src/ios/RuntimeHost/NativeShellBackend.swift \
+            verify/stubs/AppLogger.swift \
+            verify/stubs/ISHCommandResult.swift
+          echo "::notice::all 7 graft files type-check"
+
       - name: Verify the decoder against the live documents
         # Compiles the Foundation-only files with the host swiftc and runs the
         # real JSONDecoder over the real manifest and descriptors. This is the

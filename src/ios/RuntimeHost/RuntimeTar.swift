@@ -215,8 +215,14 @@ enum TarReader {
             default:
                 try fm.createDirectory(at: parent, withIntermediateDirectories: true)
                 guard let payload else {
-                    // A zero-length regular file is legitimate.
-                    Data().write(to: target, atomically: true)
+                    // A zero-length regular file is legitimate; create it anyway.
+                    // Data.write(to:atomically:) does not exist — the atomic
+                    // variant takes Data.WritingOptions.
+                    do {
+                        try Data().write(to: target, options: .atomic)
+                    } catch {
+                        throw TarError.io("write \(path)")
+                    }
                     _ = chmodPath(target.path, mode)
                     entries.append(TarEntry(path: path, kind: .file,
                                             mode: mode, size: 0, linkTarget: nil))

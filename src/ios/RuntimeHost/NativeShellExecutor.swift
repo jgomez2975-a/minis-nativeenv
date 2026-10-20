@@ -221,11 +221,11 @@ final class NativeShellExecutor {
         posix_spawnattr_setpgroup(&attr, 0)
         // Close every inherited descriptor at exec. Without this the child gets
         // a copy of every socket and DB handle the app holds — a file-lock and
-        // fd-exhaustion source, and a correctness hazard for anything that
-        // walks /dev/fd.
-        #if os(iOS)
+        // fd-exhaustion source, and a correctness hazard for anything that walks
+        // /dev/fd. No `#if os(iOS)` around it: the constant exists on both
+        // Darwin platforms, and guarding it would mean the host-side type check
+        // never saw this line.
         flags |= POSIX_SPAWN_CLOEXEC_DEFAULT
-        #endif
         posix_spawnattr_setflags(&attr, flags)
 
         let argv = [executable] + arguments

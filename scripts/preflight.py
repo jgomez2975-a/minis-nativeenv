@@ -462,8 +462,9 @@ def check_swift_format(repo: Path) -> None:
         return
 
     sources = sorted((repo / "src/ios/RuntimeHost").glob("*.swift"))
-    # The host-side harness is compiled by CI too, so it gets the same treatment.
-    sources += sorted((repo / "verify").glob("*.swift"))
+    # The host-side harness and its stubs are compiled by CI too, so they get
+    # the same treatment.
+    sources += sorted((repo / "verify").rglob("*.swift"))
     bad = 0
     for src in sources:
         proc = subprocess.run([swift_format, "lint", str(src)],
