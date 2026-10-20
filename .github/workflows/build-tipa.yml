@@ -96,8 +96,11 @@ jobs:
             src/ios/RuntimeHost/RuntimeInstaller.swift
             src/ios/RuntimeHost/NativeShellExecutor.swift
             src/ios/RuntimeHost/NativeShellBackend.swift
+            src/ios/RuntimeHost/RuntimeCatalog.swift
+            src/ios/RuntimeHost/DevCapabilitiesView.swift
             verify/stubs/AppLogger.swift
             verify/stubs/ISHCommandResult.swift
+            verify/stubs/AppLocalized.swift
           )
 
           # Pass 1 — host, which is also where the verify binary comes from.

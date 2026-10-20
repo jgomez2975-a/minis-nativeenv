@@ -1,5 +1,5 @@
 {
-  "_comment": "Key names only, harvested from the published runtime documents. Union = what a CodingKey may name; intersection = what a non-optional property requires. Used by scripts/contract_check.py.",
+  "_comment": "Key names only, harvested from the published runtime documents. Union = what a CodingKey may name; intersection = what a non-optional property requires. Regenerate with scripts/make_contract_snapshot.py.",
   "manifest_root": [
     "download_proxy_prefixes",
     "runtimes",
@@ -68,6 +68,14 @@
     "summary",
     "ui",
     "version"
+  ],
+  "ui": [
+    "symbol",
+    "tint"
+  ],
+  "ui_intersection": [
+    "symbol",
+    "tint"
   ],
   "install": [
     "environment",

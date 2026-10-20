@@ -193,6 +193,7 @@ PATCHED_FILES = (
     "src/ios/Minis.xcodeproj/project.pbxproj",
     "src/ios/MinisApp-Bridging-Header.h",
     "src/ios/Agent/ISH/ISHExecutionCoordinator.swift",
+    "src/ios/Views/ContentView.swift",
 )
 
 

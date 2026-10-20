@@ -70,6 +70,10 @@ struct RuntimeSpec: Decodable {
 
     let components: Components?
 
+    /// Icon hint for the capabilities panel: `{"symbol": "shippingbox.fill",
+    /// "tint": "teal"}`. Present on every runtime; used only for display.
+    let ui: UIBadge?
+
     // NOTE: `components` is display-only and its shape is not uniform across
     // runtimes — core_tools and node carry `{"git": "2.39.1"}`, reverse_tools
     // and theos carry `{"go-macho": {"version": "v1.1.292"}}`. Declaring it
@@ -129,6 +133,7 @@ struct RuntimeSpec: Decodable {
         case isOptional = "optional"
         case minimumIOS = "minimum_ios"
         case runtimeFormat = "runtime_format"
+        case ui
         case archiveURL = "archive_url"
         case archiveSHA256 = "archive_sha256"
         case downloadSize = "download_size"
@@ -229,8 +234,13 @@ struct InstallProbe: Decodable {
     let contains: String
 }
 
-// MARK: - Per-runtime descriptor
+/// Icon hint attached to every runtime entry.
+struct UIBadge: Decodable {
+    let symbol: String?
+    let tint: String?
+}
 
+// MARK: - Per-runtime descriptor
 /// The document behind a runtime's `metadata_url`.
 ///
 /// runtime-manifest.json is an *index*, not the full description. Three of the

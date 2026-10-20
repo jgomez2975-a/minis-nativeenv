@@ -405,6 +405,15 @@ actor RuntimeInstaller {
         }
     }
 
+    /// Public read-only view of a runtime's descriptor, for the capabilities
+    /// panel. Cached after the first fetch, so opening the panel offline still
+    /// shows what was installed.
+    func descriptor(for key: String) async -> RuntimeBundle? {
+        if manifest == nil { loadManifestFromCache() }
+        guard let spec = manifest?.runtimes[key] else { return nil }
+        return await fetchBundle(spec: spec)
+    }
+
     /// Synchronous descriptor read for the paths that cannot await.
     private func loadBundle(spec: RuntimeSpec) -> RuntimeBundle? {
         guard let data = try? Data(contentsOf: bundleCacheURL(spec)) else { return nil }

@@ -39,6 +39,7 @@ SECTIONS = {
     "InstallProbe": "probe",
     "RuntimeBundle": "bundle",
     "ShebangRewrite": "shebang",
+    "UIBadge": "ui",
 }
 
 failures: list[str] = []

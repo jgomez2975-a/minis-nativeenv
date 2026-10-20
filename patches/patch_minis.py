@@ -170,6 +170,45 @@ def patch_coordinator(path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 4. settings entry
+# ---------------------------------------------------------------------------
+
+SETTINGS_ANCHOR = '                Section("Agent Runtime") {\n'
+
+SETTINGS_ENTRY = '''                    // [runtimehost] The capabilities panel. Without a row here
+                    // the environment is uninstallable by anyone who does not
+                    // read the source: the shell silently falls back to iSH and
+                    // nothing explains why clang is missing.
+                    NavigationLink {
+                        DevCapabilitiesView()
+                    } label: {
+                        Label {
+                            Text(AppLocalized("开发能力"))
+                        } icon: {
+                            Image(systemName: "hammer.fill")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.white)
+                                .frame(width: 21, height: 21)
+                                .background(.orange, in: Circle())
+                        }
+                    }
+'''
+
+
+def patch_settings(path: Path) -> str:
+    if not path.exists():
+        return "MISSING ContentView.swift"
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if "DevCapabilitiesView" in text:
+        return "already patched"
+    if SETTINGS_ANCHOR not in text:
+        return "FAILED: 'Agent Runtime' section not found — settings layout changed"
+    text = text.replace(SETTINGS_ANCHOR, SETTINGS_ANCHOR + SETTINGS_ENTRY, 1)
+    path.write_text(text, encoding="utf-8")
+    return "patched"
+
+
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -204,6 +243,7 @@ def main() -> int:
         "project.pbxproj": patch_pbxproj(ios / "Minis.xcodeproj" / "project.pbxproj"),
         "bridging header": patch_bridging_header(ios / "MinisApp-Bridging-Header.h"),
         "ISHExecutionCoordinator": patch_coordinator(ios / "Agent" / "ISH" / "ISHExecutionCoordinator.swift"),
+        "settings entry": patch_settings(ios / "Views" / "ContentView.swift"),
     }
 
     width = max(len(k) for k in results)
