@@ -65,3 +65,6 @@
 
 // rclone static library (deps/frameworks/Rclone.xcframework) — see RcloneBridge.swift
 #import "librclone.h"
+
+// RuntimeHost: gzip streaming for the runtime installer
+#import "RuntimeArchive.h"

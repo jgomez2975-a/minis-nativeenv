@@ -100,6 +100,7 @@ jobs:
             src/ios/RuntimeHost/RuntimeInstaller.swift
             src/ios/RuntimeHost/NativeShellExecutor.swift
             src/ios/RuntimeHost/NativeShellBackend.swift
+            src/ios/RuntimeHost/RuntimeEnvironmentBrief.swift
           )
           UI=(
             src/ios/RuntimeHost/RuntimeCatalog.swift

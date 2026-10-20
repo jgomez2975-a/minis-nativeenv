@@ -351,9 +351,20 @@ actor RuntimeInstaller {
         env["CA_TOOL_RUNTIME_ROOT"] = paths.root.path
         env["DEVELOPER_DIR"] = paths.root.path
 
+        // theos-helper refuses with "artifact build authorization unavailable"
+        // unless this is set. It is the gate MT-Agent's own runtime sets before
+        // it will assemble or verify a .deb on device.
+        env["CA_BUILD_AUTHORIZED"] = "1"
+
         for (plan, root) in plans {
             for (k, v) in plan.environment {
                 env[k] = expand(v, root: root).path
+            }
+            if plan.key.lowercased().contains("theos") {
+                let nested = root.appendingPathComponent("theos")
+                let theosRoot = FileManager.default.fileExists(atPath: nested.path)
+                    ? nested : root
+                env["THEOS"] = theosRoot.path
             }
         }
 
@@ -814,22 +825,55 @@ actor RuntimeInstaller {
         return try? JSONDecoder().decode(RuntimeState.self, from: data)
     }
 
-    /// Rewrites path-entries.txt from the currently-good runtimes, so a shell
-    /// spawned mid-install sees a coherent PATH rather than a half-updated one.
+    /// Rewrites path-entries.txt and environment.txt from the currently-good
+    /// runtimes, so a shell spawned mid-install sees a coherent PATH and the
+    /// model is never told about a toolchain that is not there.
     private func rebuildPathManifest() {
         var lines: [String] = []
+        var brief: [String] = []
+
         if let m = manifest {
             let library = paths.containerLibrary
-            for state in installedStates() where state.lastProbeOK {
+            for state in installedStates().sorted(by: { $0.key < $1.key }) where state.lastProbeOK {
                 guard let spec = m.runtimes[state.key] else { continue }
                 let plan = RuntimePlan(spec: spec, bundle: loadBundle(spec: spec))
                 let root = URL(fileURLWithPath: state.installedRoot)
+
                 for entry in plan.persistentPathEntries {
                     lines.append(plan.resolvePathEntry(entry, root: root, containerLibrary: library).path)
                 }
+
+                // One line per runtime, stating where its binaries actually are.
+                // The model reads this instead of guessing at /usr/bin.
+                let entryPaths = plan.pathEntries.map {
+                    plan.resolvePathEntry($0, root: root, containerLibrary: library).path
+                }
+                let location = entryPaths.isEmpty ? root.path : entryPaths.joined(separator: ", ")
+                brief.append("  \(spec.displayName) \(spec.version) — \(location)")
             }
         }
+
         try? lines.joined(separator: "\n").write(to: paths.pathManifestURL,
                                                  atomically: true, encoding: .utf8)
+
+        if brief.isEmpty {
+            brief = ["  (none installed)"]
+        }
+        brief.append("")
+        brief.append("  .deb tooling: `theos-helper` (format-control, control-field, "
+                     + "assemble-deb, verify-deb) is on PATH; run it with no arguments "
+                     + "for usage.")
+        brief.append("  Compilation: `clang` (OLLVM, with -mllvm obfuscation flags), "
+                     + "`make package` for Theos builds.")
+        try? brief.joined(separator: "\n").write(
+            to: paths.root.appendingPathComponent("environment.txt"),
+            atomically: true, encoding: .utf8)
+    }
+
+    /// Public hook so the capabilities panel can republish the environment after
+    /// adopting runtimes it did not install itself.
+    func refreshPublishedEnvironment() {
+        if manifest == nil { loadManifestFromCache() }
+        rebuildPathManifest()
     }
 }

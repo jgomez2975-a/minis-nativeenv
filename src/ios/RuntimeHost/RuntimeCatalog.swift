@@ -119,7 +119,6 @@ final class RuntimeCatalog: ObservableObject {
 
         let states = Dictionary(uniqueKeysWithValues: await installer.installedStates().map { ($0.key, $0) })
         var built: [Item] = []
-
         for key in manifest.orderedKeys {
             guard let spec = manifest.runtimes[key], spec.isUsableByMinis else { continue }
             let bundle = await installer.descriptor(for: key)
@@ -136,6 +135,12 @@ final class RuntimeCatalog: ObservableObject {
                 status: Self.status(spec: spec, record: record)))
         }
         items = built
+
+        // Republish the model-facing environment description. Without this the
+        // shell tool keeps describing whatever was installed the last time an
+        // install ran — including "nothing installed" for a device that adopted
+        // runtimes it never installed itself.
+        await installer.refreshPublishedEnvironment()
     }
 
     // MARK: - Actions

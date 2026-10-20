@@ -8155,6 +8155,23 @@ private struct SettingsSheet: View {
                 }
 
                 Section("Agent Runtime") {
+                    // [runtimehost] The capabilities panel. Without a row here
+                    // the environment is uninstallable by anyone who does not
+                    // read the source: the shell silently falls back to iSH and
+                    // nothing explains why clang is missing.
+                    NavigationLink {
+                        DevCapabilitiesView()
+                    } label: {
+                        Label {
+                            Text(AppLocalized("开发能力"))
+                        } icon: {
+                            Image(systemName: "hammer.fill")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.white)
+                                .frame(width: 21, height: 21)
+                                .background(.orange, in: Circle())
+                        }
+                    }
                     // [T-tools-granular-switches] First row: per-tool switches.
                     NavigationLink {
                         ToolsSettingsView()

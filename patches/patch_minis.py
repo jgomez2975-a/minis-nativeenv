@@ -209,6 +209,38 @@ def patch_settings(path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 5. shell tool description
+# ---------------------------------------------------------------------------
+
+SHELL_DESC_PATTERN = re.compile(
+    r'description: "Execute a command in an isolated Linux process \(iSH/Alpine Linux\)\..*?Default timeout is 15 minutes\.",',
+    re.S)
+
+SHELL_DESC_REPLACEMENT = "description: RuntimeEnvironmentBrief.shellToolDescription,"
+
+
+def patch_shell_description(path: Path) -> str:
+    """
+    Point the shell tool at a description that matches the shell actually in use.
+
+    Upstream's text says iSH/Alpine and /bin/sh -c unconditionally. With the
+    native backend active all three claims are false, and a model that believes
+    them reaches for apk, /bin/sh and /etc/passwd instead of the toolchain that
+    is installed. The replacement is computed at runtime from what is on disk.
+    """
+    if not path.exists():
+        return "MISSING tool definitions file"
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if "RuntimeEnvironmentBrief" in text:
+        return "already patched"
+    if not SHELL_DESC_PATTERN.search(text):
+        return "FAILED: shell_execute description not found — wording changed upstream"
+    text = SHELL_DESC_PATTERN.sub(SHELL_DESC_REPLACEMENT, text, count=1)
+    path.write_text(text, encoding="utf-8")
+    return "patched"
+
+
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -244,6 +276,8 @@ def main() -> int:
         "bridging header": patch_bridging_header(ios / "MinisApp-Bridging-Header.h"),
         "ISHExecutionCoordinator": patch_coordinator(ios / "Agent" / "ISH" / "ISHExecutionCoordinator.swift"),
         "settings entry": patch_settings(ios / "Views" / "ContentView.swift"),
+        "shell description": patch_shell_description(
+            ios / "Agent" / "Chat" / "AIChatViewModel+ToolDefinitions.swift"),
     }
 
     width = max(len(k) for k in results)
