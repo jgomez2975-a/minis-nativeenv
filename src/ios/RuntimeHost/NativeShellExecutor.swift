@@ -137,7 +137,7 @@ final class NativeShellExecutor {
         }
 
         var pid: pid_t = 0
-        let argv: [String] = [bash.path, "-c", "exit 0"]
+        let argv: [String] = [bash, "-c", "exit 0"]
         guard let argvC = cStringArray(argv) else {
             cachedProbeErrno = ENOMEM
             return (false, ENOMEM)
@@ -148,7 +148,7 @@ final class NativeShellExecutor {
         posix_spawnattr_init(&attr)
         defer { posix_spawnattr_destroy(&attr) }
 
-        let rc = posix_spawn(&pid, bash.path, nil, &attr, argvC, environ)
+        let rc = posix_spawn(&pid, bash, nil, &attr, argvC, environ)
         cachedProbeErrno = rc
         guard rc == 0 else {
             log.error("native exec probe refused: \(String(cString: strerror(rc))) (\(rc))")
