@@ -1,0 +1,801 @@
+//
+//  RuntimeInstaller.swift
+//  Minis / RuntimeHost
+//
+//  Downloads, verifies, unpacks, signs and probes the toolchain runtimes
+//  described by runtime-manifest.json.
+//
+//  Ordering rules that are not negotiable:
+//
+//   * SHA-256 is checked BEFORE extraction. A truncated tarball unpacks into a
+//     tree that looks plausible and fails weeks later.
+//   * Extraction lands in `staging/<key>.tmp`, never in place. The `current`
+//     symlink is flipped with a rename(2) only after probe passes, so a
+//     half-installed runtime is never visible to a shell.
+//   * Binaries are re-signed before the probe runs. iOS kills an unsigned
+//     executable at exec, and the failure surfaces as a bare EPERM with no hint.
+//   * `required_paths` are checked after extraction. TheosRuntime silently
+//     omits sdk symlinks when its tar was built without them; that is exactly
+//     the class of defect the check exists for.
+//
+//  Everything here runs off the main actor. Downloads are large (Theos is
+//  224 MB, 980 MB unpacked) and the UI must keep streaming tokens meanwhile.
+//
+
+import Foundation
+import CryptoKit
+import os.log
+
+private let log = AppLogger(category: "RuntimeInstaller")
+
+enum InstallerError: Error, LocalizedError {
+    case manifestUnavailable
+    case downloadFailed(String, Int)
+    case checksumMismatch(expected: String, actual: String)
+    case unsupportedArchive(String)
+    case extractionFailed(String)
+    case missingPaths([String])
+    case probeFailed(String, String)
+    case signingFailed(String)
+    case insufficientSpace(need: Int64, free: Int64)
+
+    var errorDescription: String? {
+        switch self {
+        case .manifestUnavailable:
+            return "runtime manifest could not be loaded"
+        case .downloadFailed(let url, let code):
+            return "download failed (\(code)): \(url)"
+        case .checksumMismatch(let e, let a):
+            return "sha256 mismatch — expected \(e.prefix(16))… got \(a.prefix(16))…"
+        case .unsupportedArchive(let n):
+            return "unsupported archive format: \(n)"
+        case .extractionFailed(let why):
+            return "extraction failed: \(why)"
+        case .missingPaths(let p):
+            return "payload incomplete, missing \(p.count) path(s): \(p.prefix(3).joined(separator: ", "))"
+        case .probeFailed(let exe, let out):
+            return "probe failed for \(exe): \(out.prefix(200))"
+        case .signingFailed(let why):
+            return "code signing failed: \(why)"
+        case .insufficientSpace(let need, let free):
+            return "need \(need / 1_048_576) MB, \(free / 1_048_576) MB free"
+        }
+    }
+}
+
+// MARK: - Installer
+
+actor RuntimeInstaller {
+
+    static let manifestURL = URL(string:
+        "https://raw.githubusercontent.com/susu123oss/CodexApp-Runtime/main/Runtime/runtime-manifest.json")!
+
+    private let paths: RuntimePaths
+    private let fileManager = FileManager.default
+    private var manifest: RuntimeManifest?
+
+    init(paths: RuntimePaths) {
+        self.paths = paths
+    }
+
+    // MARK: Manifest
+
+    func loadManifest(forceReload: Bool = false) async throws -> RuntimeManifest {
+        if !forceReload, let manifest { return manifest }
+
+        // A cached copy makes the runtime panel usable offline; the network
+        // fetch is preferred because a stale manifest pins dead release URLs.
+        let cache = paths.root.appendingPathComponent("manifest.json")
+        do {
+            let (data, _) = try await URLSession.shared.data(from: Self.manifestURL)
+            let parsed = try JSONDecoder().decode(RuntimeManifest.self, from: data)
+            try? data.write(to: cache, options: .atomic)
+            manifest = parsed
+            return parsed
+        } catch {
+            if let data = try? Data(contentsOf: cache),
+               let parsed = try? JSONDecoder().decode(RuntimeManifest.self, from: data) {
+                log.warning("manifest fetch failed, using cache: \(error.localizedDescription)")
+                manifest = parsed
+                return parsed
+            }
+            throw InstallerError.manifestUnavailable
+        }
+    }
+
+    /// Everything Minis can use, in display order. `codex` is excluded: it is
+    /// MT-Agent's own agent host and Minis already has one.
+    func installableRuntimes() async throws -> [RuntimeSpec] {
+        let m = try await loadManifest()
+        return m.orderedKeys.compactMap { key in
+            m.runtimes[key].flatMap { $0.isUsableByMinis ? $0 : nil }
+        }
+    }
+
+    // MARK: Install
+
+    /// Full install for one runtime. Returns the state record written on success.
+    /// `progress` receives 0…1 across download and unpack, so the UI can show a
+    /// single bar rather than two.
+    func install(
+        key: String,
+        progress: (@Sendable (Double, String) -> Void)? = nil
+    ) async throws -> RuntimeState {
+
+        let m = try await loadManifest()
+        guard let spec = m.runtimes[key], spec.isUsableByMinis else {
+            throw InstallerError.manifestUnavailable
+        }
+
+        try ensureDirectories()
+
+        // Space check first: Theos needs ~1 GB unpacked, and discovering that
+        // mid-extraction leaves a 900 MB staging directory to clean up.
+        if let need = spec.unpackedSize {
+            let free = try availableBytes()
+            if free < need + (200 * 1_048_576) {
+                throw InstallerError.insufficientSpace(need: need + 200 * 1_048_576, free: free)
+            }
+        }
+
+        progress?(0.02, "preparing")
+        let archive = try await fetchArchive(spec: spec, progress: progress)
+
+        progress?(0.55, "verifying")
+        let digest = try sha256Hex(of: archive)
+        guard digest.caseInsensitiveCompare(spec.archiveSHA256) == .orderedSame else {
+            try? fileManager.removeItem(at: archive)
+            throw InstallerError.checksumMismatch(expected: spec.archiveSHA256, actual: digest)
+        }
+
+        // Fresh staging for every attempt — a leftover tree from a failed run
+        // would merge into this one and defeat required_paths.
+        try? fileManager.removeItem(at: paths.stagingDir)
+        try fileManager.createDirectory(at: paths.stagingDir, withIntermediateDirectories: true)
+        let staging = paths.stagingDir.appendingPathComponent("\(key).tmp", isDirectory: true)
+        try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
+
+        progress?(0.58, "unpacking")
+        do {
+            try extract(archive: archive, into: staging, handler: spec.handler ?? "portable-v1")
+        } catch {
+            try? fileManager.removeItem(at: staging)
+            throw error
+        }
+
+        let payload = try locatePayloadRoot(in: staging, handler: spec.handler ?? "portable-v1")
+
+        if let install = spec.install {
+            progress?(0.80, "checking")
+            let missing = install.requiredPaths.filter {
+                !fileManager.fileExists(atPath: payload.appendingPathComponent($0).path)
+            }
+            guard missing.isEmpty else {
+                try? fileManager.removeItem(at: staging)
+                throw InstallerError.missingPaths(missing)
+            }
+
+            progress?(0.85, "signing")
+            try signBinaries(install: install, root: payload)
+        }
+
+        // Commit: move into place under the revision, then flip `current`.
+        let revision = spec.revisionKey
+        let finalDir = paths.runtimeVersionDir(key, revision: revision)
+        try fileManager.createDirectory(at: paths.runtimeDir(key), withIntermediateDirectories: true)
+        try? fileManager.removeItem(at: finalDir)
+        try fileManager.moveItem(at: payload, to: finalDir)
+
+        if payload.standardizedFileURL != staging.standardizedFileURL {
+            try? fileManager.removeItem(at: staging)
+        } else {
+            try? fileManager.removeItem(at: paths.stagingDir)
+        }
+
+        let link = paths.runtimeCurrentLink(key)
+        let tmpLink = paths.runtimeDir(key).appendingPathComponent(".current.new")
+        try? fileManager.removeItem(at: tmpLink)
+        try fileManager.createSymbolicLink(atPath: tmpLink.path, withDestinationPath: finalDir.path)
+        _ = try? fileManager.replaceItemAt(link, withItemAt: tmpLink)
+
+        progress?(0.92, "probing")
+        var state = RuntimeState(key: key,
+                                 revision: revision,
+                                 version: spec.version,
+                                 installedAt: Date(),
+                                 installedRoot: finalDir.path,
+                                 lastProbeOK: false,
+                                 lastProbeOutput: nil,
+                                 failure: nil)
+
+        if let install = spec.install, let probe = install.probe {
+            do {
+                let out = try runProbe(probe, root: finalDir)
+                state.lastProbeOK = true
+                state.lastProbeOutput = out
+            } catch {
+                state.failure = error.localizedDescription
+                writeState(state)
+                throw error
+            }
+        } else {
+            state.lastProbeOK = true
+        }
+
+        writeState(state)
+        rebuildPathManifest()
+        progress?(1.0, "done")
+        log.info("installed \(key) \(spec.version) -> \(finalDir.path)")
+        return state
+    }
+
+    /// Probe-only re-check. Cheap enough to run on every app launch so a
+    /// runtime deleted by a package manager shows up as broken, not missing.
+    func verifyInstalled(key: String) async -> RuntimeState? {
+        guard let state = readState(key),
+              let spec = (try? await loadManifest())?.runtimes[key],
+              fileManager.fileExists(atPath: state.installedRoot) else { return nil }
+
+        guard let install = spec.install, let probe = install.probe else { return state }
+        do {
+            let out = try runProbe(probe, root: URL(fileURLWithPath: state.installedRoot))
+            var updated = state
+            updated.lastProbeOK = true
+            updated.lastProbeOutput = out
+            updated.failure = nil
+            writeState(updated)
+            return updated
+        } catch {
+            var updated = state
+            updated.lastProbeOK = false
+            updated.failure = error.localizedDescription
+            writeState(updated)
+            return updated
+        }
+    }
+
+    func installedStates() -> [RuntimeState] {
+        guard let keys = try? fileManager.contentsOfDirectory(atPath: paths.stateDir.path) else { return [] }
+        return keys.filter { $0.hasSuffix(".json") }
+            .compactMap { readState(String($0.dropLast(5))) }
+            .sorted { $0.key < $1.key }
+    }
+
+    // MARK: Environment
+
+    /// Builds the environment every native shell inherits.
+    ///
+    /// PATH order is deliberate: device-wide shims first (bash, sh, theos
+    /// helper), then each runtime's declared `path_entries`, then persistent
+    /// entries (npm global prefix). A model that types `rg` or `git` gets the
+    /// runtime copy, never a system one — iOS has none anyway.
+    func shellEnvironment() -> [String: String] {
+        var env: [String: String] = [:]
+
+        var pathComponents: [String] = [paths.binDir.path]
+
+        if let states = Optional(installedStates()) {
+            let m = manifest
+            for state in states where state.lastProbeOK {
+                guard let spec = m?.runtimes[state.key], let install = spec.install else { continue }
+                let root = URL(fileURLWithPath: state.installedRoot)
+                for entry in install.pathEntries {
+                    pathComponents.append(root.appendingPathComponent(entry).path)
+                }
+            }
+            for state in states where state.lastProbeOK {
+                guard let spec = m?.runtimes[state.key],
+                      let persistent = spec.install?.persistentPathEntries else { continue }
+                for entry in persistent {
+                    pathComponents.append(expand(entry, root: URL(fileURLWithPath: state.installedRoot)).path)
+                }
+            }
+        }
+
+        pathComponents.append("/usr/bin")
+        pathComponents.append("/bin")
+        pathComponents.append("/usr/sbin")
+        pathComponents.append("/sbin")
+
+        env["PATH"] = pathComponents.joined(separator: ":")
+        env["HOME"] = paths.homeDir.path
+        env["TMPDIR"] = paths.tmpDir.path
+        env["TERM"] = "xterm-256color"
+        env["LANG"] = "en_US.UTF-8"
+        env["LC_ALL"] = "en_US.UTF-8"
+        env["SHELL"] = paths.binDir.appendingPathComponent("bash").path
+        env["MINIS_RUNTIME_ROOT"] = paths.root.path
+        // Standard names the portable-v1 handler expects to see already set.
+        env["CA_TOOL_RUNTIME_ROOT"] = paths.root.path
+        env["DEVELOPER_DIR"] = paths.root.path
+
+        if let m = manifest {
+            for state in installedStates() where state.lastProbeOK {
+                guard let spec = m.runtimes[state.key], let vars = spec.install?.environment else { continue }
+                let root = URL(fileURLWithPath: state.installedRoot)
+                for (k, v) in vars {
+                    env[k] = expand(v, root: root).path
+                }
+            }
+        }
+
+        return env
+    }
+
+    /// `${RUNTIME_ROOT}` and `${RUNTIME_ROOT}/sub` expansion, as used by the
+    /// node and ollvm runtime declarations.
+    private func expand(_ template: String, root: URL) -> URL {
+        let replaced = template.replacingOccurrences(of: "${RUNTIME_ROOT}", with: root.path)
+        return URL(fileURLWithPath: replaced)
+    }
+
+    // MARK: - Download
+
+    private func fetchArchive(
+        spec: RuntimeSpec,
+        progress: (@Sendable (Double, String) -> Void)?
+    ) async throws -> URL {
+        try fileManager.createDirectory(at: paths.cacheDir, withIntermediateDirectories: true)
+        let name = spec.assetName ?? URL(string: spec.archiveURL)?.lastPathComponent ?? "\(spec.version).bin"
+        let destination = paths.cacheDir.appendingPathComponent(name)
+
+        // Reuse is safe because the checksum is re-verified by the caller; a
+        // cached file that was truncated mid-write fails the hash and is
+        // deleted there, so the next attempt re-downloads.
+        if fileManager.fileExists(atPath: destination.path) { return destination }
+
+        guard let primary = URL(string: spec.archiveURL) else {
+            throw InstallerError.downloadFailed(spec.archiveURL, 0)
+        }
+
+        var candidates: [URL] = [primary]
+        if let m = manifest {
+            for prefix in m.downloadProxyPrefixes {
+                if let proxied = URL(string: prefix + spec.archiveURL) { candidates.append(proxied) }
+            }
+        }
+
+        var lastCode = 0
+        for url in candidates {
+            do {
+                let tmp = try await download(url: url, progress: progress)
+                try fileManager.moveItem(at: tmp, to: destination)
+                return destination
+            } catch let error as InstallerError {
+                if case .downloadFailed(_, let code) = error { lastCode = code }
+                continue
+            }
+        }
+        throw InstallerError.downloadFailed(spec.archiveURL, lastCode)
+    }
+
+    private func download(
+        url: URL,
+        progress: (@Sendable (Double, String) -> Void)?
+    ) async throws -> URL {
+        // URLSession's own progress reporting needs a delegate; polling the
+        // temp file size is simpler and accurate enough for a 0.02–0.55 band.
+        let (tempURL, response) = try await URLSession.shared.download(from: url)
+        guard let http = response as? HTTPURLResponse else {
+            throw InstallerError.downloadFailed(url.absoluteString, 0)
+        }
+        guard http.statusCode == 200 else {
+            try? fileManager.removeItem(at: tempURL)
+            throw InstallerError.downloadFailed(url.absoluteString, http.statusCode)
+        }
+        progress?(0.50, "downloaded")
+        return tempURL
+    }
+
+    // MARK: - Verify
+
+    private func sha256Hex(of url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while let chunk = try handle.read(upToCount: 4 * 1_048_576), !chunk.isEmpty {
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func availableBytes() throws -> Int64 {
+        let values = try paths.root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        return values.volumeAvailableCapacityForImportantUsage ?? 0
+    }
+
+    // MARK: - Extraction
+
+    private func extract(archive: URL, into destination: URL, handler: String) throws {
+        let probe = try FileHandle(forReadingFrom: archive)
+        let head = try probe.read(upToCount: 8) ?? Data()
+        try? probe.close()
+
+        // "!<arch>\n" — a Debian package. Only the `codex` runtime ships as a
+        // deb, and that handler is skipped, but the parser stays so a future
+        // deb-packaged toolchain needs no change here.
+        if head.prefix(7) == Data("!<arch>".utf8) {
+            try extractDeb(archive: archive, into: destination)
+            return
+        }
+        if head.prefix(2) == Data([0x1f, 0x8b]) {
+            try extractTarGz(archive: archive, into: destination)
+            return
+        }
+        if head.count >= 2, head[0] == 0xFD, head[1] == 0x37 { // xz magic
+            throw InstallerError.unsupportedArchive("tar.xz")
+        }
+        if head.count >= 4, head[0] == 0x28, head[1] == 0xB5, head[2] == 0x2F, head[3] == 0xFD {
+            throw InstallerError.unsupportedArchive("tar.zst")
+        }
+        // Bare tar: ustar magic at offset 257 is the reliable check.
+        if archiveLooksLikeTar(archive) {
+            try extractTar(stream: try tarStreamFromFile(archive), into: destination)
+            return
+        }
+        throw InstallerError.unsupportedArchive(archive.lastPathComponent)
+    }
+
+    private func extractDeb(archive: URL, into destination: URL) throws {
+        let data = try Data(contentsOf: archive, options: .mappedIfSafe)
+        guard data.count > 8 else { throw InstallerError.extractionFailed("deb too short") }
+        var offset = 8 // skip "!<arch>\n"
+        var payload: Data?
+
+        while offset + 60 <= data.count {
+            let header = data.subdata(in: offset..<offset + 60)
+            let nameField = String(decoding: header[0..<16], as: UTF8.self)
+                .trimmingCharacters(in: .whitespaces)
+            let sizeField = String(decoding: header[48..<58], as: UTF8.self)
+                .trimmingCharacters(in: .whitespaces)
+            guard let size = Int(sizeField) else { break }
+            let dataStart = offset + 60
+            guard dataStart + size <= data.count else { break }
+
+            if nameField.hasPrefix("data.tar") {
+                payload = data.subdata(in: dataStart..<dataStart + size)
+                break
+            }
+            offset = dataStart + size + (size % 2) // members are 2-byte aligned
+        }
+
+        guard let payload else { throw InstallerError.extractionFailed("no data.tar member in deb") }
+
+        if payload.prefix(2) == Data([0x1f, 0x8b]) {
+            let scratch = paths.stagingDir.appendingPathComponent("data.tar.gz")
+            try payload.write(to: scratch, options: .atomic)
+            defer { try? fileManager.removeItem(at: scratch) }
+            try extractTarGz(archive: scratch, into: destination)
+            return
+        }
+        if payload.prefix(4) == Data([0xFD, 0x37, 0x7A, 0x58]) {
+            throw InstallerError.unsupportedArchive("deb(data.tar.xz)")
+        }
+        try extractTar(stream: try tarStreamFromData(payload), into: destination)
+    }
+
+    private func extractTarGz(archive: URL, into destination: URL) throws {
+        let scratch = paths.stagingDir.appendingPathComponent("inflate.tar")
+        fileManager.createFile(atPath: scratch.path, contents: nil)
+        guard let out = try? FileHandle(forWritingTo: scratch) else {
+            throw InstallerError.extractionFailed("cannot open staging tar")
+        }
+        defer { try? out.close() }
+
+        // C trampoline for zlib's streaming callback.
+        final class Sink {
+            let handle: FileHandle
+            var failed = false
+            init(_ h: FileHandle) { handle = h }
+        }
+        let sink = Sink(out)
+        let ctx = Unmanaged.passUnretained(sink).toOpaque()
+
+        let rc = ra_gunzip_stream(archive.path, { ctx, bytes, length -> Int32 in
+            guard let ctx, let bytes, length > 0 else { return 0 }
+            let sink = Unmanaged<Sink>.fromOpaque(ctx).takeUnretainedValue()
+            do {
+                try sink.handle.write(contentsOf: Data(bytes: bytes, count: length))
+                return 0
+            } catch {
+                sink.failed = true
+                return -1
+            }
+        }, ctx)
+
+        guard rc == 0, !sink.failed else {
+            try? fileManager.removeItem(at: scratch)
+            throw InstallerError.extractionFailed("gunzip rc=\(rc)")
+        }
+
+        defer { try? fileManager.removeItem(at: scratch) }
+        try extractTar(stream: try tarStreamFromFile(scratch), into: destination)
+    }
+
+    // MARK: - ar/tar plumbing types
+
+    private struct TarStream {
+        let handle: FileHandle
+        let totalSize: Int
+    }
+
+    private func tarStreamFromFile(_ url: URL) throws -> TarStream {
+        let attrs = try fileManager.attributesOfItem(atPath: url.path)
+        let size = (attrs[.size] as? NSNumber)?.intValue ?? 0
+        return TarStream(handle: try FileHandle(forReadingFrom: url), totalSize: size)
+    }
+
+    private func tarStreamFromData(_ data: Data) throws -> TarStream {
+        let scratch = paths.stagingDir.appendingPathComponent("inline.tar")
+        try data.write(to: scratch, options: .atomic)
+        return try tarStreamFromFile(scratch)
+    }
+
+    private func archiveLooksLikeTar(_ url: URL) -> Bool {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? h.close() }
+        guard let head = try? h.read(upToCount: 265), head.count >= 262 else { return false }
+        return head[257..<262] == Data("ustar".utf8)
+    }
+
+    // MARK: - tar reader
+
+    /// Minimal ustar reader: long names (GNU 'L' and pax 'x'), symlinks,
+    /// hardlinks, dirs, regular files, permissions. This is not a general tar
+    /// implementation — it deliberately ignores sparse files, device nodes and
+    /// xattrs, none of which appear in the runtime tarballs, and refusing them
+    /// loudly is better than writing them wrong.
+    private func extractTar(stream: TarStream, into destination: URL) throws {
+        let handle = stream.handle
+        defer { try? handle.close() }
+
+        var pendingLongName: String?
+        var pendingPaxPath: String?
+        var remaining = stream.totalSize
+        let base = destination.standardizedFileURL.path
+
+        func readExactly(_ count: Int) -> Data? {
+            var out = Data()
+            while out.count < count {
+                let want = count - out.count
+                guard let chunk = try? handle.read(upToCount: want), !chunk.isEmpty else { return nil }
+                out.append(chunk)
+            }
+            return out
+        }
+
+        while remaining > 0 {
+            guard let header = readExactly(512) else { break }
+            remaining -= 512
+            if header.allSatisfy({ $0 == 0 }) { break } // end-of-archive marker
+
+            func field(_ start: Int, _ length: Int) -> String {
+                let slice = header[start..<start + length]
+                let bytes = slice.prefix { $0 != 0 }
+                return String(decoding: bytes, as: UTF8.self)
+            }
+
+            let name = field(0, 100)
+            let modeStr = field(100, 8)
+            let sizeStr = field(124, 12)
+            let typeflag = header[156]
+            let linkName = field(157, 100)
+            let prefix = field(345, 155)
+
+            let size = parseTarSize(sizeStr)
+
+            // Payload bytes for this entry (padded to 512).
+            let padded = (size + 511) / 512 * 512
+            var payload: Data?
+            if size > 0 {
+                guard let body = readExactly(padded) else { break }
+                remaining -= padded
+                payload = body.prefix(size)
+            }
+
+            switch typeflag {
+            case UInt8(ascii: "L"):
+                pendingLongName = payload.flatMap { String(data: $0, encoding: .utf8) }?
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
+                continue
+            case UInt8(ascii: "x"):
+                if let body = payload.flatMap({ String(data: $0, encoding: .utf8) }),
+                   let pathLine = body.split(separator: "\n").first(where: { $0.hasPrefix("path=") }) {
+                    pendingPaxPath = String(pathLine.dropFirst(5))
+                }
+                continue
+            case UInt8(ascii: "g"):
+                continue
+            default:
+                break
+            }
+
+            var entryName = pendingLongName ?? pendingPaxPath ?? (prefix.isEmpty ? name : "\(prefix)/\(name)")
+            pendingLongName = nil
+            pendingPaxPath = nil
+            entryName = entryName.trimmingCharacters(in: CharacterSet(charactersIn: "\0/"))
+            if entryName.isEmpty { continue }
+
+            // Path traversal guard. A `../` in a runtime tarball is either a
+            // packaging bug or an attack; either way it must not escape.
+            let target = destination.appendingPathComponent(entryName).standardizedFileURL
+            guard target.path == base || target.path.hasPrefix(base + "/") else {
+                throw InstallerError.extractionFailed("path escape: \(entryName)")
+            }
+
+            let mode = mode_t(strtoul(modeStr.isEmpty ? "644" : modeStr, nil, 8) & 0o7777)
+
+            switch typeflag {
+            case UInt8(ascii: "5"):
+                try fileManager.createDirectory(at: target, withIntermediateDirectories: true)
+            case UInt8(ascii: "2"):
+                try fileManager.createDirectory(at: target.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+                try? fileManager.removeItem(at: target)
+                try fileManager.createSymbolicLink(atPath: target.path, withDestinationPath: linkName)
+            case UInt8(ascii: "1"):
+                // Hardlink: the destination is relative to the extraction root.
+                let source = destination.appendingPathComponent(linkName).standardizedFileURL
+                try fileManager.createDirectory(at: target.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+                try? fileManager.removeItem(at: target)
+                if fileManager.fileExists(atPath: source.path) {
+                    try fileManager.linkItem(at: source, to: target)
+                }
+            default:
+                try fileManager.createDirectory(at: target.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+                guard let payload else { continue }
+                try payload.write(to: target, options: .atomic)
+                // Mode matters: the toolchain is only executable with +x, and
+                // Data.write always produces 0644.
+                _ = chmod(target.path, mode | 0o400)
+            }
+        }
+    }
+
+    private func parseTarSize(_ s: String) -> Int {
+        if s.isEmpty { return 0 }
+        // base-256 encoding for files > 8 GB (first byte 0x80)
+        if let first = s.utf8.first, first & 0x80 != 0 {
+            var value = 0
+            for byte in s.utf8.dropFirst() {
+                value = value << 8 | Int(byte)
+            }
+            return value
+        }
+        return Int(s.trimmingCharacters(in: .whitespaces), radix: 8) ?? 0
+    }
+
+    // MARK: - Payload root
+
+    /// Some tarballs wrap everything in a single top directory; some do not.
+    /// Normalise so the caller always gets the directory that holds `bin/`.
+    private func locatePayloadRoot(in staging: URL, handler: String) throws -> URL {
+        let contents = try fileManager.contentsOfDirectory(at: staging,
+                                                           includingPropertiesForKeys: [.isDirectoryKey],
+                                                           options: [.skipsHiddenFiles])
+        // Already a payload root?
+        if contents.contains(where: { ["bin", "lib", "sdks", "Frameworks"].contains($0.lastPathComponent) }) {
+            return staging
+        }
+        // Single wrapper directory?
+        if contents.count == 1 {
+            let only = contents[0]
+            let isDir = (try? only.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            if isDir { return only }
+        }
+        throw InstallerError.extractionFailed("cannot determine payload root (\(contents.count) top-level entries)")
+    }
+
+    // MARK: - Signing
+
+    /// Re-sign with the bundled `codex-sign`, which is MT-Agent's own helper:
+    /// it thins FAT slices, re-encodes the code directory and (for the
+    /// entitlement-carrying pass) fakes a CMS so CoreTrust accepts the result.
+    /// `ldid -S` is not used because it cannot produce a blob CoreTrust accepts
+    /// for a platform binary on modern iOS.
+    private func signBinaries(install: InstallInstructions, root: URL) throws {
+        guard let signer = Bundle.main.url(forAuxiliaryExecutable: "Helpers/codex-sign")
+                ?? bundledHelper("codex-sign") else {
+            // No signer means an ad-hoc signed payload; still assign +x so a
+            // jailbroken device that already trusts everything can run it.
+            log.warning("codex-sign missing, skipping re-sign")
+            return
+        }
+
+        let withEntitlements = install.signPaths.map { root.appendingPathComponent($0) }
+            .filter { fileManager.fileExists(atPath: $0.path) }
+        let adhocOnly = install.signPathsWithoutEntitlements.map { root.appendingPathComponent($0) }
+            .filter { fileManager.fileExists(atPath: $0.path) }
+
+        if !withEntitlements.isEmpty {
+            try runSigner(signer, files: withEntitlements, entitlements: nil, adhocOnly: false)
+        }
+        if !adhocOnly.isEmpty {
+            try runSigner(signer, files: adhocOnly, entitlements: nil, adhocOnly: true)
+        }
+    }
+
+    private func bundledHelper(_ name: String) -> URL? {
+        Bundle.main.bundleURL.appendingPathComponent("Helpers/\(name)")
+    }
+
+    private func runSigner(_ signer: URL, files: [URL], entitlements: URL?, adhocOnly: Bool) throws {
+        var args: [String] = []
+        if adhocOnly { args.append("--adhoc-only") }
+        if let entitlements { args.append(contentsOf: ["--entitlements", entitlements.path]) }
+        args.append(contentsOf: files.map(\.path))
+
+        let result = try NativeShellExecutor.shared.run(
+            executable: signer.path,
+            arguments: args,
+            environment: ["HOME": paths.homeDir.path, "TMPDIR": paths.tmpDir.path],
+            timeout: 120)
+
+        guard result.exitCode == 0 else {
+            throw InstallerError.signingFailed(result.errorOutput.isEmpty ? result.output : result.errorOutput)
+        }
+    }
+
+    // MARK: - Probe
+
+    private func runProbe(_ probe: InstallProbe, root: URL) throws -> String {
+        let exe = root.appendingPathComponent(probe.executable)
+        guard fileManager.isExecutableFile(atPath: exe.path) else {
+            throw InstallerError.probeFailed(probe.executable, "not executable at \(exe.path)")
+        }
+        var env = shellEnvironment()
+        env["RUNTIME_ROOT"] = root.path
+
+        let result = try NativeShellExecutor.shared.run(
+            executable: exe.path,
+            arguments: probe.arguments,
+            environment: env,
+            currentDirectory: root.path,
+            timeout: 90)
+
+        let combined = result.output + result.errorOutput
+        guard combined.contains(probe.contains) else {
+            throw InstallerError.probeFailed(probe.executable,
+                                             "exit=\(result.exitCode) output=\(combined.prefix(300))")
+        }
+        return combined.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: - Filesystem bookkeeping
+
+    private func ensureDirectories() throws {
+        for dir in [paths.runtimesDir, paths.cacheDir, paths.binDir, paths.stateDir, paths.tmpDir] {
+            try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+    }
+
+    private func writeState(_ state: RuntimeState) {
+        guard let data = try? JSONEncoder().encode(state) else { return }
+        try? data.write(to: paths.stateURL(state.key), options: .atomic)
+    }
+
+    private func readState(_ key: String) -> RuntimeState? {
+        guard let data = try? Data(contentsOf: paths.stateURL(key)) else { return nil }
+        return try? JSONDecoder().decode(RuntimeState.self, from: data)
+    }
+
+    /// Rewrites path-entries.txt from the currently-good runtimes, so a shell
+    /// spawned mid-install sees a coherent PATH rather than a half-updated one.
+    private func rebuildPathManifest() {
+        var lines: [String] = []
+        if let m = manifest {
+            for state in installedStates() where state.lastProbeOK {
+                guard let spec = m.runtimes[state.key],
+                      let persistent = spec.install?.persistentPathEntries else { continue }
+                let root = URL(fileURLWithPath: state.installedRoot)
+                for entry in persistent {
+                    lines.append(expand(entry, root: root).path)
+                }
+            }
+        }
+        try? lines.joined(separator: "\n").write(to: paths.pathManifestURL,
+                                                 atomically: true, encoding: .utf8)
+    }
+}

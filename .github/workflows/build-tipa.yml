@@ -1,0 +1,231 @@
+name: build-tipa
+
+# Builds Minis with the native runtime host grafted in and emits a .tipa.
+#
+# Why CI instead of a local build: this app cannot be produced off macOS.
+# It targets iOS 26.2 / Swift 6, links iSH (meson + clang), FFmpeg (autotools +
+# the Metal toolchain), rclone (Go static xcframework) and links several SwiftPM
+# binary targets. There is no Windows or Linux path to that binary. The runner
+# here is the build machine.
+#
+# Wall clock: ~35 min cold (native deps are the bulk), ~8 min warm with the
+# deps cache. The job is well inside the 6h ceiling.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: "CFBundleIdentifier to stamp"
+        required: false
+        default: "com.openminis.app"
+      skip_native_deps:
+        description: "Reuse cached native deps (deps/ cache hit anyway)"
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths:
+      - "src/ios/RuntimeHost/**"
+      - ".github/workflows/build-tipa.yml"
+
+concurrency:
+  group: build-tipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # macos-26 ships Xcode 26 / iOS 26 SDK, which IPHONEOS_DEPLOYMENT_TARGET=26.2
+    # requires. macos-latest is NOT enough — it may still resolve to 15.
+    runs-on: macos-26
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Verify submodules
+        run: |
+          set -eu
+          for d in deps/ish deps/proot; do
+            if [ -z "$(ls -A "$d" 2>/dev/null)" ]; then
+              echo "::error::$d is empty — submodule init failed"
+              git submodule update --init --recursive "$d"
+            fi
+          done
+
+      - name: Toolchain versions
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos || true
+          swift --version
+          go version
+
+      - name: Build-time customization files
+        run: |
+          set -eu
+          cp -n src/ios/Configs/ProviderCustomization.xcconfig.example \
+                src/ios/Configs/ProviderCustomization.xcconfig || true
+          cp -n src/android/app/provider-customization.properties.example \
+                src/android/app/provider-customization.properties || true
+
+      - name: Install build dependencies
+        run: |
+          set -eu
+          brew install ninja llvm libarchive pkg-config go make || true
+          python3 -m pip install --user meson
+          echo "$HOME/Library/Python/$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')/bin" >> $GITHUB_PATH
+
+      - name: Metal toolchain
+        # FFmpeg's configure probes for `metal`; without it the
+        # yadif_videotoolbox deinterlace filter is silently dropped.
+        run: |
+          xcodebuild -downloadComponent MetalToolchain || \
+            echo "::warning::MetalToolchain download failed — FFmpeg loses yadif_videotoolbox"
+          xcrun -sdk iphoneos metal --version || true
+
+      - name: Cache native deps
+        uses: actions/cache@v4
+        id: deps-cache
+        with:
+          path: |
+            deps/lame-build
+            deps/frameworks
+            deps/libs
+            deps/include
+            deps/resources
+          key: deps-${{ runner.os }}-${{ hashFiles('deps/build_*.sh', 'deps/prepare_alpine_rootfs.sh', 'deps/ish/**', 'deps/proot/**') }}
+
+      - name: Build LAME
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: ./deps/build_lame.sh
+
+      - name: Build FFmpeg
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: ./deps/build_ffmpeg.sh
+
+      - name: Build iSH
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: ./deps/build_ish.sh
+
+      - name: Prepare Alpine rootfs
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: ./deps/prepare_alpine_rootfs.sh
+
+      - name: Build rclone xcframework
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: ./deps/build_rclone_ios.sh
+
+      - name: Verify native deps
+        run: |
+          set -eu
+          test -f deps/lame-build/lib/libmp3lame.a      || { echo "::error::lame missing"; exit 1; }
+          test -d deps/frameworks/FFmpeg.framework      || { echo "::error::ffmpeg missing"; exit 1; }
+          test -d deps/libs                              || { echo "::error::ish libs missing"; exit 1; }
+          test -f deps/resources/alpine-rootfs.zip      || { echo "::error::rootfs missing"; exit 1; }
+          test -d deps/frameworks/Rclone.xcframework    || { echo "::error::rclone missing"; exit 1; }
+          echo "all native deps present"
+
+      # ---------------------------------------------------------------------
+      # Runtime helpers: bash, the multicall coreutils host, and the signer.
+      # These are the pieces MT-Agent ships that make the environment real.
+      # ---------------------------------------------------------------------
+      - name: Fetch runtime helpers from MT-Agent
+        run: |
+          set -eu
+          MT_VERSION="1.0.5"
+          MT_URL="https://github.com/susu123oss/MT-Agent/releases/download/${MT_VERSION}/MT-Agent-v${MT_VERSION}-Lite.tipa"
+          curl -fL --retry 3 -o /tmp/mt.tipa "$MT_URL"
+          rm -rf /tmp/mt && mkdir -p /tmp/mt
+          unzip -q /tmp/mt.tipa -d /tmp/mt
+          # Staged OUTSIDE the synchronized source group: these are extensionless
+          # arm64 binaries, and a synchronized group would try to treat them as
+          # build inputs. They are copied into the built .app instead.
+          rm -rf runtime-helpers && mkdir -p runtime-helpers
+          cp -a /tmp/mt/Payload/CodexApp.app/Helpers/. runtime-helpers/
+          rm -rf runtime-helpers/TheosCompat runtime-helpers/TheosCoreCompat
+          test -x runtime-helpers/bash.real    || { echo "::error::bash.real missing"; exit 1; }
+          test -x runtime-helpers/ca-filetool  || { echo "::error::ca-filetool missing"; exit 1; }
+          test -x runtime-helpers/codex-sign   || { echo "::error::codex-sign missing"; exit 1; }
+          ls -l runtime-helpers | head -40
+
+      - name: Apply the runtime-host graft
+        run: |
+          set -eu
+          python3 patches/patch_minis.py --repo .
+          # entitlements: platform-application makes the bundle TrollStore-only
+          cp entitlements/Minis-TrollStore.entitlements src/ios/Minis.entitlements
+          echo "--- patched tree ---"
+          ls -la src/ios/RuntimeHost
+          grep -n "native-runtime-graft" src/ios/Agent/ISH/ISHExecutionCoordinator.swift | head -3
+
+      - name: Build app (unsigned)
+        env:
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: |
+          set -eu
+          xcodebuild \
+            -project src/ios/Minis.xcodeproj \
+            -scheme Minis \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DD \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PRODUCT_BUNDLE_IDENTIFIER="${BUNDLE_ID:-com.openminis.app}" \
+            ONLY_ACTIVE_ARCH=NO \
+            build | tee build/xcodebuild.log | tail -60
+
+          APP=$(find build/DD/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          test -n "$APP" || { echo "::error::no .app produced"; grep -i error build/xcodebuild.log | head -20; exit 1; }
+          echo "APP=$APP" >> $GITHUB_ENV
+          echo "built: $APP"
+
+      - name: Package .tipa
+        run: |
+          set -eu
+          # Helpers land in the bundle now, after the build, so Xcode never sees
+          # them as inputs. The app looks for Bundle/Helpers/bash at runtime.
+          mkdir -p "$APP/Helpers"
+          cp -a runtime-helpers/. "$APP/Helpers/"
+          chmod +x "$APP/Helpers/bash.real" "$APP/Helpers/ca-filetool" "$APP/Helpers/codex-sign"
+          for link in "$APP/Helpers"/*; do
+            [ -L "$link" ] || continue
+            target=$(readlink "$link")
+            echo "symlink $(basename "$link") -> $target"
+          done
+          test -x "$APP/Helpers/bash" || { echo "::error::Helpers/bash not resolvable"; exit 1; }
+
+          python3 scripts/make_tipa.py \
+            --app "$APP" \
+            --entitlements entitlements/Minis-TrollStore.entitlements \
+            --out "dist/Minis-nativeenv-${GITHUB_SHA::7}.tipa"
+
+      - name: Report
+        run: |
+          set -eu
+          ls -lh dist/
+          python3 - <<'PY'
+          import glob, hashlib, os
+          for p in sorted(glob.glob("dist/*.tipa")):
+              h = hashlib.sha256(open(p,"rb").read()).hexdigest()
+              print(f"{os.path.basename(p)}  {os.path.getsize(p)/1e6:.1f} MB  sha256={h}")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: minis-nativeenv-tipa
+          path: dist/*.tipa
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Keep build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: build/xcodebuild.log
+          retention-days: 7

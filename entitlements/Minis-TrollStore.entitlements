@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Minis-TrollStore.entitlements
+	  Replaces src/ios/Minis.entitlements for the native-environment build.
+
+	  Why the swap: OpenMinis' shipped entitlements are App Store-legal and
+	  therefore cannot exec a child process. Every path below is what lets
+	  posix_spawn reach a real arm64 binary and lets the app read/write the
+	  device-wide runtime root.
+
+	  CONSEQUENCE, stated plainly: this bundle is TrollStore-only. It cannot be
+	  signed for the App Store, cannot be installed by SideStore/AltStore with a
+	  free developer certificate (those inject their own App IDs and strip
+	  unknown entitlements), and an ordinary `codesign` with a developer cert
+	  will be rejected at launch because `platform-application` is a
+	  platform-only entitlement. Install through TrollStore, or as a rootless/
+	  rootful deb on a jailbroken device.
+
+	  Everything OpenMinis needs for its own features is preserved verbatim
+	  below: HealthKit, HomeKit, CloudKit, iCloud documents, NFC, WeatherKit,
+	  App Groups. Dropping any of them silently disables a device tool.
+	-->
+	<key>platform-application</key>
+	<true/>
+
+	<key>com.apple.private.security.no-sandbox</key>
+	<true/>
+	<key>com.apple.private.security.no-container</key>
+	<true/>
+	<key>com.apple.private.security.storage.AppDataContainers</key>
+	<true/>
+	<key>com.apple.private.security.storage.AppBundles</key>
+	<true/>
+
+	<!-- lets the shell see other processes' info (ps-like tooling) -->
+	<key>proc_info-allow</key>
+	<true/>
+
+	<!-- background execution for long compiles; Without this theos builds
+	     get suspended the moment the app leaves the foreground -->
+	<key>com.apple.private.background-task.allowed</key>
+	<true/>
+
+	<!-- Theos emits 4 GB+ Mach-O targets on device; the default VA limit is
+	     not enough for a full sdk-linked link step -->
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+
+	<!-- runtime root lives outside the container -->
+	<key>com.apple.private.persona-mgmt</key>
+	<true/>
+
+	<!-- required alongside platform-application for a non-container app -->
+	<key>get-task-allow</key>
+	<true/>
+
+	<!-- ===== stock OpenMinis entitlements, preserved ===== -->
+	<key>aps-environment</key>
+	<string>development</string>
+	<key>com.apple.developer.healthkit</key>
+	<true/>
+	<key>com.apple.developer.healthkit.access</key>
+	<array>
+		<string>health-records</string>
+	</array>
+	<key>com.apple.developer.homekit</key>
+	<true/>
+	<key>com.apple.developer.icloud-container-identifiers</key>
+	<array>
+		<string>iCloud.com.openminis.app</string>
+	</array>
+	<key>com.apple.developer.icloud-services</key>
+	<array>
+		<string>CloudKit</string>
+	</array>
+	<key>com.apple.developer.nfc.readersession.formats</key>
+	<array>
+		<string>TAG</string>
+		<string>PACE</string>
+	</array>
+	<key>com.apple.developer.ubiquity-container-identifiers</key>
+	<array>
+		<string>iCloud.com.openminis.app</string>
+	</array>
+	<key>com.apple.developer.weatherkit</key>
+	<true/>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.openminis.app</string>
+		<!-- shared with the runtime root so extensions can read installed tools -->
+		<string>group.com.openminis.app.runtime</string>
+	</array>
+</dict>
+</plist>
