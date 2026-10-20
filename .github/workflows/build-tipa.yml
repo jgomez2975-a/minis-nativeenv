@@ -185,7 +185,9 @@ jobs:
           echo "--- installed SDKs ---"
           xcodebuild -showsdks || true
           swift --version
-          go version
+          # go arrives from brew in a later step; asking for it here exits 127
+          # under `set -e`.
+          command -v go >/dev/null 2>&1 && go version || echo "go: not installed yet (expected)"
 
           # The project pins IPHONEOS_DEPLOYMENT_TARGET = 26.2. A runner image
           # can carry Xcode 26 with an older point SDK (26.0/26.1), and then the
