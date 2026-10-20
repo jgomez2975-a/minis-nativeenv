@@ -121,79 +121,44 @@ def thin_binaries(app: Path) -> None:
 
 class Signer:
     """
-    Picks a signer that demonstrably works, rather than the first one on PATH.
+    Prefers ldid, and says so plainly when it is unavailable.
 
-    Three candidates exist and they are not interchangeable:
+    The distinction that matters is not "signed or not" but *what the CMS slot
+    contains*:
 
-      * ldid 2.1.5 (Homebrew) — exits 0 while writing a signature that current
-        `codesign` reports as "code object is not signed at all".
-      * ProcursusTeam/ldid — the fork the TrollStore tooling uses, but its
-        current HEAD does not compile against OpenSSL 3.
-      * codesign — always present, always embeds the entitlements blob, no CMS.
+      ldid -S        writes a fake CMS chain (~4 KB). CoreTrust can evaluate it,
+                     which is the whole mechanism TrollStore relies on.
+      codesign -s -  writes a CMS *wrapper with zero bytes of payload*. Every
+                     entitlement is present and `codesign --verify` reports
+                     success, and the app still dies at launch: there is nothing
+                     in the signature for CoreTrust to accept.
 
-    So each candidate is tried on a throwaway copy of a real Mach-O, and one
-    that cannot put `platform-application` into a signature that reads back is
-    rejected here instead of 20 minutes into a build.
+    That second case shipped once. An earlier version of this class "verified"
+    candidates with `codesign -d --entitlements`, which rejected ldid precisely
+    because codesign cannot parse ldid's fake CMS — the opposite of a defect.
+    Verification now belongs to scripts/sig_probe.py, which measures the CMS
+    payload, and it runs against the finished archive in CI.
     """
 
     def __init__(self, entitlements: Path | None = None) -> None:
         self.codesign = which("codesign")
         self.entitlements = entitlements
 
-        candidates = []
-        for candidate in ("/usr/local/bin/ldid", which("ldid")):
-            if candidate and Path(candidate).exists() and candidate not in candidates:
-                candidates.append(candidate)
-
         self.ldid = None
-        for candidate in candidates:
-            if self._verify(candidate, via_ldid=True):
+        for candidate in ("/usr/local/bin/ldid", "/opt/homebrew/bin/ldid", which("ldid")):
+            if candidate and Path(candidate).exists():
                 self.ldid = candidate
-                print(f"  signer: ldid ({candidate})")
-                return
-            print(f"  rejected signer: {candidate} (signature does not read back)")
+                break
 
-        if self.codesign and self._verify(self.codesign, via_ldid=False):
-            print("  signer: codesign (ad-hoc, entitlements embedded)")
-            return
-        if self.codesign:
-            # Even without a readable read-back, codesign is the only remaining
-            # option; say so loudly rather than refusing to package.
-            print("  WARNING: codesign could not be verified; packaging anyway")
-            return
-
-        raise SystemExit("error: no working signer (tried ldid and codesign)")
-
-    def _verify(self, tool: str, via_ldid: bool) -> bool:
-        """Sign a temp copy and read the entitlement back. Cheapest real test."""
-        import tempfile
-
-        if not self.entitlements or not self.entitlements.exists():
-            return False
-        probe_src = Path("/bin/echo")
-        if not probe_src.exists():
-            return False
-
-        try:
-            with tempfile.TemporaryDirectory() as td:
-                probe = Path(td) / "probe"
-                shutil.copy2(probe_src, probe)
-                if via_ldid:
-                    cmd = [tool, f"-S{self.entitlements}", str(probe)]
-                else:
-                    cmd = [tool, "--force", "--sign", "-", "--timestamp=none",
-                           "--entitlements", str(self.entitlements), str(probe)]
-                if subprocess.run(cmd, capture_output=True).returncode != 0:
-                    return False
-
-                dump = subprocess.run(
-                    [which("codesign") or "codesign", "-d", "--entitlements", ":-",
-                     str(probe)],
-                    capture_output=True, text=True,
-                    encoding="utf-8", errors="replace")
-                return "platform-application" in (dump.stdout + dump.stderr)
-        except Exception:
-            return False
+        if self.ldid:
+            print(f"  signer: ldid ({self.ldid}) — writes a fake CMS chain")
+        elif self.codesign:
+            print("  signer: codesign")
+            print("  WARNING: ad-hoc codesign writes an EMPTY CMS blob. The package")
+            print("           will install but the app will be killed at launch by")
+            print("           CoreTrust. scripts/sig_probe.py will fail this build.")
+        else:
+            raise SystemExit("error: no signer available (need ldid or codesign)")
 
     def sign(self, target: Path, entitlements: Path | None = None) -> None:
         if self.ldid:

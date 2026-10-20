@@ -266,30 +266,19 @@ jobs:
           fi
 
       - name: Install ldid
-        # Optional, and deliberately non-fatal. ProcursusTeam/ldid current HEAD
-        # does not compile against OpenSSL 3 (X509 became const-correct), and
-        # Homebrew's ldid 2.1.5 writes a signature current codesign calls
-        # "code object is not signed at all". make_tipa.py therefore self-tests
-        # every candidate signer and falls back to codesign, which always embeds
-        # the entitlements blob. This step just gives it a better option when one
-        # exists.
-        continue-on-error: true
+        # Required, not optional: `codesign -s -` writes a CMS wrapper with zero
+        # bytes of payload, so the package installs and then the app is killed at
+        # launch. ldid -S writes the fake certificate chain CoreTrust actually
+        # evaluates, which is the mechanism TrollStore depends on.
         run: |
           set -euo pipefail
-          brew install libplist make || true
-          git clone --depth 1 https://github.com/ProcursusTeam/ldid /tmp/ldid-src
-          # OpenSSL 3 made several X509 accessors return const pointers; the
-          # current ldid source still assigns them to non-const locals.
-          sed -i '' \
-            -e 's/X509_NAME \*nm = X509_get_subject_name(x);/X509_NAME *nm = (X509_NAME *)X509_get_subject_name(x);/' \
-            -e 's/e = X509_NAME_get_entry(nm, lastpos);/e = (X509_NAME_ENTRY *)X509_NAME_get_entry(nm, lastpos);/' \
-            -e 's/ASN1_STRING \*s = X509_NAME_ENTRY_get_data(e);/ASN1_STRING *s = (ASN1_STRING *)X509_NAME_ENTRY_get_data(e);/' \
-            /tmp/ldid-src/ldid.cpp
-          if make -C /tmp/ldid-src -j"$(sysctl -n hw.ncpu)"; then
-            install -m 0755 /tmp/ldid-src/ldid /usr/local/bin/ldid
-            echo "Procursus ldid installed; make_tipa.py will self-test it"
+          brew install ldid || true
+          if command -v ldid >/dev/null 2>&1; then
+            echo "ldid: $(command -v ldid)"
+            ldid 2>&1 | head -3 || true
           else
-            echo "::warning::Procursus ldid did not build; packaging will use codesign"
+            echo "::error::ldid unavailable — ad-hoc codesign cannot produce a trusted signature"
+            exit 1
           fi
 
       - name: Disk headroom
@@ -455,6 +444,15 @@ jobs:
             --app "$APP" \
             --entitlements entitlements/Minis-TrollStore.entitlements \
             --out "dist/Minis-nativeenv-${GITHUB_SHA::7}.tipa"
+
+      - name: Verify the signature carries a real CMS
+        # The gate that the previous build lacked. A package can install, carry
+        # all twenty entitlements, pass `codesign --verify`, and still be killed
+        # by CoreTrust at launch because the CMS slot is empty. Measuring the
+        # payload is the only check that catches it without a device.
+        run: |
+          set -euo pipefail
+          python3 scripts/sig_probe.py dist/*.tipa
 
       - name: Report
         run: |
