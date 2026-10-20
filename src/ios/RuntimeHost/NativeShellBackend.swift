@@ -161,7 +161,7 @@ actor NativeShellBackend {
         let sessionRoot = paths.root.appendingPathComponent("sessions/\(sanitize(sessionId))")
         let cwd = FileManager.default.fileExists(atPath: sessionRoot.path) ? sessionRoot.path : paths.homeDir.path
 
-        var mirror = StringBuilder(limit: maxOutputChars)
+        let mirror = StringBuilder(limit: maxOutputChars)
 
         let result: NativeShellResult
         do {

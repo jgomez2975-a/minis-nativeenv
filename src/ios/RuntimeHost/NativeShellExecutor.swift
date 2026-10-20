@@ -217,7 +217,11 @@ final class NativeShellExecutor {
 
         // New process group: kill(-pid, SIGKILL) then reaches the entire tree,
         // which is what makes the stop button actually stop a `make -j8`.
-        var flags: Int16 = POSIX_SPAWN_SETPGROUP
+        // The POSIX_SPAWN_* constants import as Int32 while
+        // posix_spawnattr_setflags takes Int16. Both values are small (0x0002
+        // and 0x0400) so the narrowing is exact; the casts are required, not
+        // cosmetic.
+        var flags: Int16 = Int16(POSIX_SPAWN_SETPGROUP)
         posix_spawnattr_setpgroup(&attr, 0)
         // Close every inherited descriptor at exec. Without this the child gets
         // a copy of every socket and DB handle the app holds — a file-lock and
@@ -225,7 +229,7 @@ final class NativeShellExecutor {
         // /dev/fd. No `#if os(iOS)` around it: the constant exists on both
         // Darwin platforms, and guarding it would mean the host-side type check
         // never saw this line.
-        flags |= POSIX_SPAWN_CLOEXEC_DEFAULT
+        flags |= Int16(POSIX_SPAWN_CLOEXEC_DEFAULT)
         posix_spawnattr_setflags(&attr, flags)
 
         let argv = [executable] + arguments
@@ -286,15 +290,15 @@ final class NativeShellExecutor {
 
         group.enter()
         DispatchQueue.global(qos: .userInitiated).async {
-            Self.drain(fd: outPipe[0], control: control) { chunk in
-                collector.append(chunk, isStdErr: false)
+            Self.drain(fd: outPipe[0], control: control) { pointer, count in
+                collector.append(pointer, count: count, isStdErr: false)
             }
             group.leave()
         }
         group.enter()
         DispatchQueue.global(qos: .userInitiated).async {
-            Self.drain(fd: errPipe[0], control: control) { chunk in
-                collector.append(chunk, isStdErr: true)
+            Self.drain(fd: errPipe[0], control: control) { pointer, count in
+                collector.append(pointer, count: count, isStdErr: true)
             }
             group.leave()
         }
