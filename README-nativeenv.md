@@ -219,4 +219,76 @@ App Store 装法、AltStore/SideStore 免费证书都装不上 —— `platform-
 
 同批顺手改名:`optional` → `isOptional`(manifest 模型)、`prefix` → `namePrefix`(tar 头解析)。
 
+---
+
+## 8. 第三轮:解码层静态契约校验,抓到一个会毁掉整个子系统的 bug
+
+### 8.1 那条 bug
+
+`InstallInstructions.signPathsWithoutEntitlements` 声明成**非可选** `[String]`。
+
+真实文档里,6 个 `install` 块中只有 2 个带这个键 —— `core_tools` 没有。Swift 合成的 `Decodable`
+遇到缺键直接 throw,而 `RuntimeSpec.install` 是**所有运行时一次性解码**的文档的一部分:
+
+```
+core_tools 缺一个键  →  InstallInstructions 抛错  →  RuntimeSpec 抛错
+                    →  RuntimeManifest 整个失败  →  loadManifest() 抛错
+                    →  运行时子系统整体不可用
+```
+
+不是"核心工具装不上",是**一个都装不上**,而且报错只有一个 `runtime manifest could not be loaded`,
+看不出是哪一行。修法是手写 `init(from:)`,所有列表 `decodeIfPresent ?? []`:
+缺一个列表的语义本来就是"这个运行时没有这些",不是"文档坏了"。
+
+### 8.2 顺手删掉的死字段
+
+`RuntimeSpec` 上原本声明了 `runtime_id` / `format` / `sign_paths` / `executables` /
+`libraries` / `portable_shebangs`。这六个键**只存在于 bundle 描述符,index 里从来没有** ——
+换句话说六个字段永远是 nil,读代码的人会以为 index 是权威源。全部移除,只留 bundle 侧。
+
+同理 `RuntimeBundle.signPathsWithoutEntitlements` 也删了:它实际在 `install` 块里,不在顶层。
+
+### 8.3 怎么发现的
+
+试过装 Swift for Windows 想直接跑解码器,装了 6.4.1,`swiftc` / `swift-frontend` 一律
+`0xC0000142`(DLL 初始化失败,165 MB 的 frontend 直接 crash),放弃。
+
+改成**静态契约校验**,效果其实更好:
+
+```
+verify/contract-snapshot.json     从真实文档里抽出来的键名集合(只存键名,不存值和 URL)
+scripts/contract_check.py         把 Swift 里的 Decodable 声明解析出来,对着快照验
+```
+
+两条规则:
+
+- **keys** — CodingKeys 里写的每个 JSON 键,必须至少在一个真实文档里出现过。拼错立刻暴露。
+- **fields** — 非可选属性,它的键必须在**每一个**同类文档里都在;缺一个就 throw。
+  写了自定义 `init(from:)` 的,改成检查 init 里对这个键用的是 `decode` 还是 `decodeIfPresent`。
+
+为了区分"某些文档有、某些没有",快照同时存**并集**和**交集**。交集就是非可选属性的硬要求。
+
+第 8.1 条 bug 就是 `fields` 规则抓的,原文:
+
+```
+InstallInstructions.signPathsWithoutEntitlements is non-optional but
+"sign_paths_without_entitlements" is missing from at least one real install
+document — decoding will throw for that one
+```
+
+反向验证过:把 `decodeIfPresent` 改回 `decode`,检查立刻变红;改回来立刻变绿。
+
+### 8.4 现在一共有三层验证
+
+| 层 | 在哪跑 | 抓什么 | 耗时 |
+|---|---|---|---|
+| `preflight.py` 11 项 | 每次提交 / CI 第一步 | 语法、plist、pbxproj、关键字、解码契约 | ~20 s |
+| `contract_check.py` | preflight 内 | 解码层 × 真实文档 | <1 s |
+| `verify/main.swift` | **CI 里用真 `swiftc` 编译并运行** | 真的 `JSONDecoder` 跑真的文档 | ~5 s |
+
+第三层是关键:它不是我的复刻,是**真的 Swift 解码**。CI 里先把三个纯 Foundation 文件编成可执行文件,
+拉下真实 manifest 和 6 个描述符,跑一遍,把所有运行时的推导结果打成表打出来。
+逆向那套"我以为是"的东西,到这一步才算被编译器承认。
+
+
 

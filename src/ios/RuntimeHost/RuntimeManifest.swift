@@ -79,20 +79,13 @@ struct RuntimeSpec: Decodable {
     let radare2Version: String?
     let sdk: String?
 
-    /// Present on every runtime but only authoritative when `install` is absent.
-    let runtimeID: String?
-    let format: Int?
-
-    /// Declared at the top level by the formats with no `install` block
-    /// (python, reverse_tools). Same meaning as `install.sign_paths`.
-    let signPaths: [String]?
-
-    /// theos only: the exact binaries and dylibs to re-sign.
-    let executables: [String]?
-    let libraries: [String]?
-
-    /// theos only: scripts whose shebang points at `env`, which finds nothing on iOS.
-    let portableShebangs: [ShebangRewrite]?
+    // NOTE: `runtime_id`, `format`, `sign_paths`, `executables`, `libraries` and
+    // `portable_shebangs` are deliberately NOT modelled here. They exist only in
+    // the per-runtime descriptor (`RuntimeBundle`); the manifest index never
+    // carries them. Declaring them on both shapes produced six fields that were
+    // permanently nil, which reads like the index is authoritative when it is
+    // not — and the whole point of `RuntimePlan` is to be honest about which
+    // document said what.
 
     enum CodingKeys: String, CodingKey {
         case displayName = "display_name"
@@ -111,11 +104,6 @@ struct RuntimeSpec: Decodable {
         case pythonVersion = "python_version"
         case llvmVersion = "llvm_version"
         case radare2Version = "radare2_version"
-        case runtimeID = "runtime_id"
-        case format
-        case signPaths = "sign_paths"
-        case executables, libraries
-        case portableShebangs = "portable_shebangs"
     }
 
     /// The `handler` tells the host how to unpack and where the payload's root
@@ -134,8 +122,8 @@ struct RuntimeSpec: Decodable {
 
 struct InstallInstructions: Decodable {
     let pathEntries: [String]
-    let persistentPathEntries: [String]?
-    let environment: [String: String]?
+    let persistentPathEntries: [String]
+    let environment: [String: String]
     let probe: InstallProbe?
     let requiredPaths: [String]
     let signPaths: [String]
@@ -149,6 +137,48 @@ struct InstallInstructions: Decodable {
         case signPaths = "sign_paths"
         case signPathsWithoutEntitlements = "sign_paths_without_entitlements"
     }
+
+    /// Hand-written so every list defaults to empty instead of throwing.
+    ///
+    /// This is not defensive style, it is a correctness requirement: the
+    /// published install blocks disagree about which keys they carry.
+    /// `sign_paths_without_entitlements` appears in two of six documents and
+    /// `persistent_path_entries` in one. With synthesised decoding, one such
+    /// omission throws — and because `RuntimeSpec.install` is part of a document
+    /// that is decoded for *every* runtime at once, that single missing key
+    /// failed the entire manifest, leaving the runtime subsystem with nothing.
+    ///
+    /// An absent list now means "this runtime contributes none of these", which
+    /// is what the documents actually intend.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        pathEntries = try c.decodeIfPresent([String].self, forKey: .pathEntries) ?? []
+        persistentPathEntries = try c.decodeIfPresent([String].self,
+                                                      forKey: .persistentPathEntries) ?? []
+        environment = try c.decodeIfPresent([String: String].self, forKey: .environment) ?? [:]
+        probe = try c.decodeIfPresent(InstallProbe.self, forKey: .probe)
+        requiredPaths = try c.decodeIfPresent([String].self, forKey: .requiredPaths) ?? []
+        signPaths = try c.decodeIfPresent([String].self, forKey: .signPaths) ?? []
+        signPathsWithoutEntitlements = try c.decodeIfPresent(
+            [String].self, forKey: .signPathsWithoutEntitlements) ?? []
+    }
+
+    /// Used by `RuntimePlan` when a runtime declares no install block at all.
+    init(pathEntries: [String] = [],
+         persistentPathEntries: [String] = [],
+         environment: [String: String] = [:],
+         probe: InstallProbe? = nil,
+         requiredPaths: [String] = [],
+         signPaths: [String] = [],
+         signPathsWithoutEntitlements: [String] = []) {
+        self.pathEntries = pathEntries
+        self.persistentPathEntries = persistentPathEntries
+        self.environment = environment
+        self.probe = probe
+        self.requiredPaths = requiredPaths
+        self.signPaths = signPaths
+        self.signPathsWithoutEntitlements = signPathsWithoutEntitlements
+    }
 }
 
 /// A runtime is "installed" when its probe exits 0 AND stdout contains the
@@ -158,6 +188,12 @@ struct InstallProbe: Decodable {
     let executable: String
     let arguments: [String]
     let contains: String
+
+    init(executable: String, arguments: [String], contains: String) {
+        self.executable = executable
+        self.arguments = arguments
+        self.contains = contains
+    }
 }
 
 // MARK: - Per-runtime descriptor
@@ -175,7 +211,6 @@ struct RuntimeBundle: Decodable {
     let runtimeID: String?
     let install: InstallInstructions?
     let signPaths: [String]?
-    let signPathsWithoutEntitlements: [String]?
     let executables: [String]?
     let libraries: [String]?
     let portableShebangs: [ShebangRewrite]?
@@ -186,7 +221,6 @@ struct RuntimeBundle: Decodable {
         case runtimeID = "runtime_id"
         case install
         case signPaths = "sign_paths"
-        case signPathsWithoutEntitlements = "sign_paths_without_entitlements"
         case executables, libraries, sdk
         case portableShebangs = "portable_shebangs"
     }

@@ -76,7 +76,7 @@ struct RuntimePlan {
     /// Where the index and the descriptor disagree the descriptor wins: it is
     /// the document that was produced alongside the archive.
     init(spec: RuntimeSpec, bundle: RuntimeBundle? = nil) {
-        self.key = spec.runtimeID ?? bundle?.runtimeID ?? spec.displayName.lowercased()
+        self.key = bundle?.runtimeID ?? spec.displayName.lowercased()
         self.displayName = spec.displayName
         self.version = spec.version
 
@@ -97,25 +97,21 @@ struct RuntimePlan {
                 $0.split(separator: "/").first.map(String.init)
             })
             if !install.pathEntries.isEmpty { paths = install.pathEntries }
-            env = install.environment ?? [:]
+            env = install.environment
             reqPaths = install.requiredPaths
             signed = install.signPaths
             adhoc = install.signPathsWithoutEntitlements
             probe = install.probe
-        }
-
-        // 2. The formats with no install block declare their sign set flat.
-        if signed.isEmpty {
-            if let fromBundle = bundle?.signPaths, !fromBundle.isEmpty {
-                signed = fromBundle
-                notes.append("sign_paths from the runtime descriptor")
-            } else if let top = spec.signPaths, !top.isEmpty {
-                signed = top
-                notes.append("sign_paths from the manifest index")
+            if reqPaths.isEmpty {
+                notes.append("descriptor declares no required_paths — file checks will be skipped")
             }
         }
-        if adhoc.isEmpty, let fromBundle = bundle?.signPathsWithoutEntitlements {
-            adhoc = fromBundle
+
+        // 2. The formats with no install block declare their sign set flat, and
+        //    only in the descriptor. The manifest index never carries one.
+        if signed.isEmpty, let fromBundle = bundle?.signPaths, !fromBundle.isEmpty {
+            signed = fromBundle
+            notes.append("sign_paths from the runtime descriptor")
         }
 
         // 3. Format-specific layout. Each branch states what it is reconstructing.
@@ -141,8 +137,7 @@ struct RuntimePlan {
                 paths = ["theos/bin", "usr/bin", "usr/local/bin", "bin"]
                 reqPaths = ["theos/bin", "theos/makefiles"]
                 if signed.isEmpty {
-                    signed = (bundle?.executables ?? spec.executables ?? [])
-                        + (bundle?.libraries ?? spec.libraries ?? [])
+                    signed = (bundle?.executables ?? []) + (bundle?.libraries ?? [])
                 }
                 notes.append("theos layout reconstructed from its rootfs tree and sdks/")
                 if let sdk = spec.sdk ?? bundle?.sdk {
@@ -163,7 +158,7 @@ struct RuntimePlan {
         self.signWithEntitlements = signed
         self.signAdhocOnly = adhoc
         self.probe = probe
-        self.shebangRewrites = bundle?.portableShebangs ?? spec.portableShebangs ?? []
+        self.shebangRewrites = bundle?.portableShebangs ?? []
         self.derivedNotes = notes
     }
 

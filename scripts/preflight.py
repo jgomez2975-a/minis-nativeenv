@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-preflight.py — fail in 20 seconds instead of 35 minutes.
+preflight.py 鈥?fail in 20 seconds instead of 35 minutes.
 
 The CI job spends ~35 minutes compiling native dependencies before the first
 line of the app is built. A typo in a Swift file, a misplaced comma in the
@@ -62,7 +62,8 @@ def fail(msg: str) -> None:
 
 def check_python(repo: Path) -> None:
     print("\n[1] python scripts")
-    targets = ["patches/patch_minis.py", "scripts/make_tipa.py", "scripts/preflight.py"]
+    targets = ["patches/patch_minis.py", "scripts/make_tipa.py",
+               "scripts/preflight.py", "scripts/contract_check.py"]
     # py_compile writes atomically via rename, which cannot target an open
     # handle on Windows. Compile into a temp *directory* instead.
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -183,7 +184,7 @@ def check_bundle_plists(repo: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# pbxproj — run the real patch on a copy, then audit the result
+# pbxproj 鈥?run the real patch on a copy, then audit the result
 # ---------------------------------------------------------------------------
 
 PATCHED_FILES = (
@@ -213,7 +214,7 @@ def check_pbxproj(repo: Path) -> None:
         patcher = repo / "patches/patch_minis.py"
         result = subprocess.run(
             [sys.executable, str(patcher), "--repo", str(repo)],
-            capture_output=True, text=True)
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
         print("    " + (result.stdout or "").strip().replace("\n", "\n    "))
 
         text = pbx.read_text(encoding="utf-8")
@@ -229,7 +230,7 @@ def check_pbxproj(repo: Path) -> None:
 
         # The group must belong to the *app* target. Checking the first
         # `fileSystemSynchronizedGroups` in the file would inspect MinisUITests,
-        # which legitimately does not carry it — so locate the Minis target
+        # which legitimately does not carry it 鈥?so locate the Minis target
         # block and read its own list.
         target = re.search(
             r"\t\t[A-Z0-9]{8,24} /\* Minis \*/ = \{\n\t\t\tisa = PBXNativeTarget;(.*?)\n\t\t\};",
@@ -313,7 +314,7 @@ def check_swift(repo: Path) -> None:
             ok(f"{src.name} ({len(text)} bytes)")
 
     # The C shim gets its own pass. tree-sitter's C grammar cannot model
-    # `extern "C" {`, so the guards are stripped before parsing — otherwise
+    # `extern "C" {`, so the guards are stripped before parsing 鈥?otherwise
     # every header using the standard idiom reports a phantom error.
     try:
         import tree_sitter_c
@@ -354,13 +355,13 @@ def check_bridging(repo: Path) -> None:
     # header that will import it.
     header = repo / "src/ios/RuntimeHost/RuntimeArchive.h"
     if not header.exists():
-        fail("src/ios/RuntimeHost/RuntimeArchive.h missing — Swift cannot see ra_gunzip_stream")
+        fail("src/ios/RuntimeHost/RuntimeArchive.h missing 鈥?Swift cannot see ra_gunzip_stream")
     else:
         ok("RuntimeArchive.h present in the source group")
 
     bridged = repo / "src/ios/MinisApp-Bridging-Header.h"
     if not bridged.exists():
-        fail("src/ios/MinisApp-Bridging-Header.h missing — the C shim would be invisible")
+        fail("src/ios/MinisApp-Bridging-Header.h missing 鈥?the C shim would be invisible")
     else:
         ok("bridging header present (import added by the patcher)")
 
@@ -374,7 +375,7 @@ def check_coordinator(repo: Path) -> None:
     text = path.read_text(encoding="utf-8", errors="replace")
     anchor = "guard ISHKernel.shared.isBooted else {"
     if anchor not in text:
-        fail("booted-guard anchor missing — patch_minis.py will not find its insertion point")
+        fail("booted-guard anchor missing 鈥?patch_minis.py will not find its insertion point")
     else:
         ok("anchor present")
 
@@ -392,7 +393,7 @@ def check_coordinator(repo: Path) -> None:
 def check_swift_keywords(repo: Path) -> None:
     print("\n[10] swift keyword identifiers")
     # A variable named after a declaration modifier parses in most positions and
-    # then stops parsing in others — `required = [...]` inside a `case` body
+    # then stops parsing in others 鈥?`required = [...]` inside a `case` body
     # reads as the start of a declaration. That cost an hour to find once; this
     # check makes it a five-second failure instead.
     modifiers = {
@@ -416,6 +417,24 @@ def check_swift_keywords(repo: Path) -> None:
                 found += 1
     if found == 0:
         ok("no variables shadowing declaration modifiers")
+
+
+def check_decode_contract(repo: Path) -> None:
+    print("\n[11] decode contract")
+    script = repo / "scripts" / "contract_check.py"
+    if not script.exists():
+        warn("contract_check.py absent")
+        return
+    result = subprocess.run([sys.executable, str(script), "--repo", str(repo)],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace")
+    for line in (result.stdout or "").strip().split("\n"):
+        if line.strip():
+            print("    " + line)
+    if result.returncode != 0:
+        fail("decode contract violated 鈥?a field would silently decode as nil, "
+             "or a whole document would fail to decode")
+    else:
+        ok("every modelled key exists; every required field is present")
 
 
 def check_applogger(repo: Path) -> None:
@@ -451,16 +470,18 @@ def main() -> int:
     check_coordinator(repo)
     check_applogger(repo)
     check_swift_keywords(repo)
+    check_decode_contract(repo)
 
     print()
     if failures:
-        print(f"FAILED — {len(failures)} problem(s), {len(warnings)} warning(s)")
+        print(f"FAILED 鈥?{len(failures)} problem(s), {len(warnings)} warning(s)")
         for f in failures:
             print("  * " + f)
         return 1
-    print(f"PASSED — 0 problems, {len(warnings)} warning(s)")
+    print(f"PASSED 鈥?0 problems, {len(warnings)} warning(s)")
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
+

@@ -62,6 +62,39 @@ jobs:
           python3 scripts/preflight.py --repo .
           echo "::notice::preflight passed"
 
+      - name: Verify the decoder against the live documents
+        # Compiles the three Foundation-only files with the host swiftc and runs
+        # the real JSONDecoder over the real manifest and descriptors. This is
+        # the only check that exercises Swift's actual decoding rather than a
+        # re-implementation of it, and it costs a few seconds.
+        run: |
+          set -eu
+          swiftc -O \
+            src/ios/RuntimeHost/RuntimeManifest.swift \
+            src/ios/RuntimeHost/RuntimePlan.swift \
+            src/ios/RuntimeHost/RuntimePaths.swift \
+            verify/main.swift \
+            -o /tmp/verify-plan
+
+          mkdir -p /tmp/docs
+          curl -fsSL -o /tmp/docs/manifest.json \
+            https://raw.githubusercontent.com/susu123oss/CodexApp-Runtime/main/Runtime/runtime-manifest.json
+          # Descriptor URLs come from the manifest itself so a release bump does
+          # not need a workflow edit.
+          python3 - <<'PY'
+          import json, pathlib, subprocess
+          m = json.load(open('/tmp/docs/manifest.json', encoding='utf-8-sig'))
+          for key, spec in m['runtimes'].items():
+              url = spec.get('metadata_url')
+              if not url:
+                  continue
+              out = f'/tmp/docs/{key}.json'
+              subprocess.run(['curl', '-fsSL', '-o', out, url], check=True)
+              print(f'  fetched descriptor {key}')
+          PY
+
+          /tmp/verify-plan /tmp/docs/manifest.json /tmp/docs
+
       - name: Toolchain versions
         id: sdk
         run: |
