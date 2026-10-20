@@ -515,11 +515,22 @@ actor RuntimeInstaller {
             throw InstallerError.unsupportedArchive("tar.zst")
         }
         // Bare tar: ustar magic at offset 257 is the reliable check.
-        if archiveLooksLikeTar(archive) {
-            try extractTar(stream: try tarStreamFromFile(archive), into: destination)
+        if TarReader.looksLikeTar(archive) {
+            try extractBareTar(archive: archive, into: destination)
             return
         }
         throw InstallerError.unsupportedArchive(archive.lastPathComponent)
+    }
+
+    /// Wraps TarReader's errors in the installer's own error surface so a
+    /// failure carries a path and a stage rather than a bare case.
+    private func extractBareTar(archive: URL, into destination: URL) throws {
+        do {
+            let entries = try TarReader.extract(archive: archive, into: destination)
+            log.debug("tar: wrote \(entries.count) entries from \(archive.lastPathComponent)")
+        } catch let error as TarError {
+            throw InstallerError.extractionFailed(error.localizedDescription)
+        }
     }
 
     private func extractDeb(archive: URL, into destination: URL) throws {
@@ -557,7 +568,10 @@ actor RuntimeInstaller {
         if payload.prefix(4) == Data([0xFD, 0x37, 0x7A, 0x58]) {
             throw InstallerError.unsupportedArchive("deb(data.tar.xz)")
         }
-        try extractTar(stream: try tarStreamFromData(payload), into: destination)
+        let scratch = paths.stagingDir.appendingPathComponent("data.tar")
+        try payload.write(to: scratch, options: .atomic)
+        defer { try? fileManager.removeItem(at: scratch) }
+        try extractBareTar(archive: scratch, into: destination)
     }
 
     private func extractTarGz(archive: URL, into destination: URL) throws {
@@ -595,162 +609,7 @@ actor RuntimeInstaller {
         }
 
         defer { try? fileManager.removeItem(at: scratch) }
-        try extractTar(stream: try tarStreamFromFile(scratch), into: destination)
-    }
-
-    // MARK: - ar/tar plumbing types
-
-    private struct TarStream {
-        let handle: FileHandle
-        let totalSize: Int
-    }
-
-    private func tarStreamFromFile(_ url: URL) throws -> TarStream {
-        let attrs = try fileManager.attributesOfItem(atPath: url.path)
-        let size = (attrs[.size] as? NSNumber)?.intValue ?? 0
-        return TarStream(handle: try FileHandle(forReadingFrom: url), totalSize: size)
-    }
-
-    private func tarStreamFromData(_ data: Data) throws -> TarStream {
-        let scratch = paths.stagingDir.appendingPathComponent("inline.tar")
-        try data.write(to: scratch, options: .atomic)
-        return try tarStreamFromFile(scratch)
-    }
-
-    private func archiveLooksLikeTar(_ url: URL) -> Bool {
-        guard let h = try? FileHandle(forReadingFrom: url) else { return false }
-        defer { try? h.close() }
-        guard let head = try? h.read(upToCount: 265), head.count >= 262 else { return false }
-        return head[257..<262] == Data("ustar".utf8)
-    }
-
-    // MARK: - tar reader
-
-    /// Minimal ustar reader: long names (GNU 'L' and pax 'x'), symlinks,
-    /// hardlinks, dirs, regular files, permissions. This is not a general tar
-    /// implementation — it deliberately ignores sparse files, device nodes and
-    /// xattrs, none of which appear in the runtime tarballs, and refusing them
-    /// loudly is better than writing them wrong.
-    private func extractTar(stream: TarStream, into destination: URL) throws {
-        let handle = stream.handle
-        defer { try? handle.close() }
-
-        var pendingLongName: String?
-        var pendingPaxPath: String?
-        var remaining = stream.totalSize
-        let base = destination.standardizedFileURL.path
-
-        func readExactly(_ count: Int) -> Data? {
-            var out = Data()
-            while out.count < count {
-                let want = count - out.count
-                guard let chunk = try? handle.read(upToCount: want), !chunk.isEmpty else { return nil }
-                out.append(chunk)
-            }
-            return out
-        }
-
-        while remaining > 0 {
-            guard let header = readExactly(512) else { break }
-            remaining -= 512
-            if header.allSatisfy({ $0 == 0 }) { break } // end-of-archive marker
-
-            func field(_ start: Int, _ length: Int) -> String {
-                let slice = header[start..<start + length]
-                let bytes = slice.prefix { $0 != 0 }
-                return String(decoding: bytes, as: UTF8.self)
-            }
-
-            let name = field(0, 100)
-            let modeStr = field(100, 8)
-            let sizeStr = field(124, 12)
-            let typeflag = header[156]
-            let linkName = field(157, 100)
-            let namePrefix = field(345, 155)
-
-            let size = parseTarSize(sizeStr)
-
-            // Payload bytes for this entry (padded to 512).
-            let padded = (size + 511) / 512 * 512
-            var payload: Data?
-            if size > 0 {
-                guard let body = readExactly(padded) else { break }
-                remaining -= padded
-                payload = body.prefix(size)
-            }
-
-            switch typeflag {
-            case UInt8(ascii: "L"):
-                pendingLongName = payload.flatMap { String(data: $0, encoding: .utf8) }?
-                    .trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
-                continue
-            case UInt8(ascii: "x"):
-                if let body = payload.flatMap({ String(data: $0, encoding: .utf8) }),
-                   let pathLine = body.split(separator: "\n").first(where: { $0.hasPrefix("path=") }) {
-                    pendingPaxPath = String(pathLine.dropFirst(5))
-                }
-                continue
-            case UInt8(ascii: "g"):
-                continue
-            default:
-                break
-            }
-
-            var entryName = pendingLongName ?? pendingPaxPath ?? (namePrefix.isEmpty ? name : "\(namePrefix)/\(name)")
-            pendingLongName = nil
-            pendingPaxPath = nil
-            entryName = entryName.trimmingCharacters(in: CharacterSet(charactersIn: "\0/"))
-            if entryName.isEmpty { continue }
-
-            // Path traversal guard. A `../` in a runtime tarball is either a
-            // packaging bug or an attack; either way it must not escape.
-            let target = destination.appendingPathComponent(entryName).standardizedFileURL
-            guard target.path == base || target.path.hasPrefix(base + "/") else {
-                throw InstallerError.extractionFailed("path escape: \(entryName)")
-            }
-
-            let mode = mode_t(strtoul(modeStr.isEmpty ? "644" : modeStr, nil, 8) & 0o7777)
-
-            switch typeflag {
-            case UInt8(ascii: "5"):
-                try fileManager.createDirectory(at: target, withIntermediateDirectories: true)
-            case UInt8(ascii: "2"):
-                try fileManager.createDirectory(at: target.deletingLastPathComponent(),
-                                                withIntermediateDirectories: true)
-                try? fileManager.removeItem(at: target)
-                try fileManager.createSymbolicLink(atPath: target.path, withDestinationPath: linkName)
-            case UInt8(ascii: "1"):
-                // Hardlink: the destination is relative to the extraction root.
-                let source = destination.appendingPathComponent(linkName).standardizedFileURL
-                try fileManager.createDirectory(at: target.deletingLastPathComponent(),
-                                                withIntermediateDirectories: true)
-                try? fileManager.removeItem(at: target)
-                if fileManager.fileExists(atPath: source.path) {
-                    try fileManager.linkItem(at: source, to: target)
-                }
-            default:
-                try fileManager.createDirectory(at: target.deletingLastPathComponent(),
-                                                withIntermediateDirectories: true)
-                guard let payload else { continue }
-                try payload.write(to: target, options: .atomic)
-                // Mode matters: the toolchain is only executable with +x, and
-                // Data.write always produces 0644.
-                _ = chmod(target.path, mode | 0o400)
-            }
-        }
-    }
-
-    private func parseTarSize(_ s: String) -> Int {
-        if s.isEmpty { return 0 }
-        // base-256 encoding for files > 8 GB (first byte 0x80)
-        if let first = s.utf8.first, first & 0x80 != 0 {
-            var value = 0
-            for byte in s.utf8.dropFirst() {
-                value = value << 8 | Int(byte)
-            }
-            return value
-        }
-        return Int(s.trimmingCharacters(in: .whitespaces), radix: 8) ?? 0
+        try extractBareTar(archive: scratch, into: destination)
     }
 
     // MARK: - Payload root

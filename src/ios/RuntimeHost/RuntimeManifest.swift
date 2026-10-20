@@ -184,16 +184,13 @@ struct InstallInstructions: Decodable {
 /// A runtime is "installed" when its probe exits 0 AND stdout contains the
 /// sentinel. Presence of files alone is not enough: a half-extracted tree looks
 /// complete on disk and fails only when the model calls it.
+///
+/// No hand-written init: Swift synthesises the memberwise one, and an explicit
+/// copy of it is just a second thing to keep in step.
 struct InstallProbe: Decodable {
     let executable: String
     let arguments: [String]
     let contains: String
-
-    init(executable: String, arguments: [String], contains: String) {
-        self.executable = executable
-        self.arguments = arguments
-        self.contains = contains
-    }
 }
 
 // MARK: - Per-runtime descriptor

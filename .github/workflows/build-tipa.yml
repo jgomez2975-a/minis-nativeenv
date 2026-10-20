@@ -63,9 +63,9 @@ jobs:
           echo "::notice::preflight passed"
 
       - name: Verify the decoder against the live documents
-        # Compiles the three Foundation-only files with the host swiftc and runs
-        # the real JSONDecoder over the real manifest and descriptors. This is
-        # the only check that exercises Swift's actual decoding rather than a
+        # Compiles the Foundation-only files with the host swiftc and runs the
+        # real JSONDecoder over the real manifest and descriptors. This is the
+        # only check that exercises Swift's actual decoding rather than a
         # re-implementation of it, and it costs a few seconds.
         run: |
           set -eu
@@ -73,8 +73,10 @@ jobs:
             src/ios/RuntimeHost/RuntimeManifest.swift \
             src/ios/RuntimeHost/RuntimePlan.swift \
             src/ios/RuntimeHost/RuntimePaths.swift \
+            src/ios/RuntimeHost/RuntimeTar.swift \
             verify/main.swift \
-            -o /tmp/verify-plan
+            -o /tmp/verify-host
+          echo "verify-host built"
 
           mkdir -p /tmp/docs
           curl -fsSL -o /tmp/docs/manifest.json \
@@ -82,18 +84,59 @@ jobs:
           # Descriptor URLs come from the manifest itself so a release bump does
           # not need a workflow edit.
           python3 - <<'PY'
-          import json, pathlib, subprocess
+          import json, subprocess
           m = json.load(open('/tmp/docs/manifest.json', encoding='utf-8-sig'))
           for key, spec in m['runtimes'].items():
               url = spec.get('metadata_url')
               if not url:
                   continue
-              out = f'/tmp/docs/{key}.json'
-              subprocess.run(['curl', '-fsSL', '-o', out, url], check=True)
+              subprocess.run(['curl', '-fsSL', '-o', f'/tmp/docs/{key}.json', url], check=True)
               print(f'  fetched descriptor {key}')
           PY
 
-          /tmp/verify-plan /tmp/docs/manifest.json /tmp/docs
+          /tmp/verify-host plans /tmp/docs/manifest.json /tmp/docs
+
+      - name: Verify the tar reader against a real payload
+        # RuntimeTar is ~250 lines of hand-written binary parsing that nothing
+        # else exercises. This runs it over the smallest published runtime and
+        # diffs the result against ground truth produced by Python's tarfile.
+        run: |
+          set -eu
+          ARCHIVE_URL="https://github.com/susu123oss/CodexApp-Runtime/releases/download/runtime-core-tools-d16eac405af9/CoreToolsRuntime.tar.gz"
+          curl -fsSL -o /tmp/coretools.tar.gz "$ARCHIVE_URL"
+          gzip -dc /tmp/coretools.tar.gz > /tmp/coretools.tar
+
+          /tmp/verify-host tar /tmp/coretools.tar /tmp/tar-out > /tmp/tar-manifest.txt
+          # The manifest JSON is everything up to the first blank line.
+          python3 - <<'PY'
+          import json, sys, pathlib
+          raw = pathlib.Path('/tmp/tar-manifest.txt').read_text()
+          head, _, tail = raw.partition('\n\n')
+          got = json.loads(head)
+          want = json.loads(pathlib.Path('verify/tar-fixture.json').read_text())
+
+          print(tail.strip())
+
+          gmap = {e['path']: e for e in got}
+          wmap = {e['path']: e for e in want}
+          problems = []
+          for path in sorted(set(wmap) - set(gmap)):
+              problems.append(f'missing: {path}')
+          for path in sorted(set(gmap) - set(wmap)):
+              problems.append(f'unexpected: {path}')
+          for path in sorted(set(gmap) & set(wmap)):
+              g, w = gmap[path], wmap[path]
+              for field in ('kind', 'mode', 'size', 'link', 'sha256'):
+                  if g.get(field) != w.get(field):
+                      problems.append(f'{path}: {field} {g.get(field)!r} != {w.get(field)!r}')
+
+          if problems:
+              print(f'TAR FIXTURE MISMATCH ({len(problems)}):')
+              for p in problems[:25]:
+                  print('  *', p)
+              sys.exit(1)
+          print(f'OK — {len(got)} entries match the fixture exactly')
+          PY
 
       - name: Toolchain versions
         id: sdk

@@ -1,0 +1,138 @@
+[
+  {
+    "path": "bin",
+    "kind": "5",
+    "mode": 493,
+    "size": 0,
+    "link": null,
+    "sha256": null
+  },
+  {
+    "path": "bin/ca-coretools",
+    "kind": "0",
+    "mode": 493,
+    "size": 89824,
+    "link": null,
+    "sha256": "4b1548650ba9a585fb920e39472aad8f763bce838b5013c918bf915e85f7a33f"
+  },
+  {
+    "path": "bin/curl",
+    "kind": "0",
+    "mode": 493,
+    "size": 5333416,
+    "link": null,
+    "sha256": "8e76bf04c578a4f222b48f6e09ed8ea38b94501d1d30e8a1c1e751f668356e7e"
+  },
+  {
+    "path": "bin/diff",
+    "kind": "2",
+    "mode": 493,
+    "size": 0,
+    "link": "ca-coretools",
+    "sha256": null
+  },
+  {
+    "path": "bin/file",
+    "kind": "2",
+    "mode": 493,
+    "size": 0,
+    "link": "ca-coretools",
+    "sha256": null
+  },
+  {
+    "path": "bin/git",
+    "kind": "0",
+    "mode": 493,
+    "size": 3237568,
+    "link": null,
+    "sha256": "1680b2c31cf51e3d7d64e7e4a87f35a2808aa83b066bc020cfcd585738a896b7"
+  },
+  {
+    "path": "bin/git-receive-pack",
+    "kind": "2",
+    "mode": 493,
+    "size": 0,
+    "link": "git",
+    "sha256": null
+  },
+  {
+    "path": "bin/git-remote-http",
+    "kind": "0",
+    "mode": 493,
+    "size": 7065440,
+    "link": null,
+    "sha256": "4e5a1b56a7498dff8a6ce49b3d6198d2287f034d69e1e96c58b7814e97db0628"
+  },
+  {
+    "path": "bin/git-remote-https",
+    "kind": "2",
+    "mode": 493,
+    "size": 0,
+    "link": "git-remote-http",
+    "sha256": null
+  },
+  {
+    "path": "bin/git-shell",
+    "kind": "2",
+    "mode": 493,
+    "size": 0,
+    "link": "git",
+    "sha256": null
+  },
+  {
+    "path": "bin/git-upload-pack",
+    "kind": "2",
+    "mode": 493,
+    "size": 0,
+    "link": "git",
+    "sha256": null
+  },
+  {
+    "path": "bin/jq",
+    "kind": "0",
+    "mode": 493,
+    "size": 810856,
+    "link": null,
+    "sha256": "527623d2eb45b5934c27fa042dae7549b8bbb594bfe7541d381a392854b52517"
+  },
+  {
+    "path": "bin/patch",
+    "kind": "2",
+    "mode": 493,
+    "size": 0,
+    "link": "ca-coretools",
+    "sha256": null
+  },
+  {
+    "path": "bin/rg",
+    "kind": "0",
+    "mode": 493,
+    "size": 7361936,
+    "link": null,
+    "sha256": "e18a127f555170b1c11371463511b5f632da745d6bcd256474251bd46c96258b"
+  },
+  {
+    "path": "bin/unzip",
+    "kind": "2",
+    "mode": 493,
+    "size": 0,
+    "link": "ca-coretools",
+    "sha256": null
+  },
+  {
+    "path": "bin/zip",
+    "kind": "2",
+    "mode": 493,
+    "size": 0,
+    "link": "ca-coretools",
+    "sha256": null
+  },
+  {
+    "path": "manifest.json",
+    "kind": "0",
+    "mode": 420,
+    "size": 825,
+    "link": null,
+    "sha256": "c65a19220a74c6d9793a8a86e22c72e31e849b1c743429b6eb4ae0daa22a2b1e"
+  }
+]

@@ -290,5 +290,76 @@ document — decoding will throw for that one
 拉下真实 manifest 和 6 个描述符,跑一遍,把所有运行时的推导结果打成表打出来。
 逆向那套"我以为是"的东西,到这一步才算被编译器承认。
 
+---
+
+## 9. 第四轮:tar 解析器的 PAX bug,和把 tar 也纳入真跑
+
+### 9.1 那个 bug
+
+原代码:
+
+```swift
+body.split(separator: "\n").first(where: { $0.hasPrefix("path=") })
+```
+
+PAX 扩展头的记录格式是 `LEN key=value\n`,**长度数字在最前面**:
+
+```
+30 path=/some/very/long/path/that/exceeds/100/bytes
+```
+
+`hasPrefix("path=")` 永远不成立。后果:超过 100 字节的路径全部静默退回 ustar 的截断名。
+python 运行时 1207 个文件、theos 30146 个文件里必然有长路径 —— 那批文件会落到错误的位置,
+或者被截断成同名互相覆盖。
+
+修法:按第一个空格切断,再按 `=` 切,取 `rest[..<equals] == "path"`。顺带把 `Data` 切片换成
+`[UInt8]`,避免 `Data` 索引起点不为 0 的坑。
+
+### 9.2 把 tar 变成可跑的
+
+`RuntimeTar.swift` 从 `RuntimeInstaller` 里抽出来了,纯 Foundation,约 250 行:
+
+- 同一个文件既能编进 iOS app,也能用宿主 `swiftc` 编成测试可执行文件
+- 抽出后顺便有了明确的返回类型 `[TarEntry]`(path / kind / mode / size / linkTarget),
+  测试才能断言"它到底写了什么"
+
+`verify/tar-fixture.json` 是**独立实现给的地面真值** —— 用 Python 的 `tarfile` 解同一个包。
+CI 里现在这么跑:
+
+```
+下载 CoreToolsRuntime.tar.gz → gzip -dc → 真 TarReader 解到临时目录
+→ 输出 canonical manifest(含每个文件的 sha256)
+→ 和 fixture 逐字段 diff:path / kind / mode / size / link / sha256
+```
+
+外加一个不依赖 fixture 的断言:每个符号链接必须能解析,每个文件必须真的落在记录的位置上。
+只写对名字、写错位置的那种 bug,fixture diff 过得去,这一关过不去。
+
+### 9.3 顺便:换掉了 tree-sitter
+
+装 Swift for Windows 时发现 `swift-format` 能跑(`swiftc` 和 `swift-frontend` 仍然 `0xC0000142`),
+而 `swift-format` 里就是 Apple 自己的 swift-syntax 解析器。
+
+于是 `preflight.py` 加了第 12 项:对每个 Swift 文件跑 `swift-format lint`,只看 `: error:` 级别。
+tree-sitter 抓粗粒度语法错,swift-syntax 抓剩下那部分 —— 它就是 Xcode 将来要用的那个解析器。
+Xcode 自带 `swift-format`,所以 CI 上一定有。
+
+结果:8 个文件(含 `verify/main.swift`)**零解析错误**。
+
+顺带它揪出一个:`InstallProbe` 上我手写的 init 和编译器合成的一模一样,删掉。
+
+### 9.4 现在的验证栈
+
+| 层 | 抓什么 | 在哪跑 |
+|---|---|---|
+| `preflight` 12 项 | plist / pbxproj / 关键字 / 解码契约 / **swift-syntax 解析** | 每次提交 |
+| `contract_check` | Decodable 声明 × 真实文档 | preflight 内 |
+| `verify-host plans` | **真 JSONDecoder** × 真文档 | CI |
+| `verify-host tar` | **真 TarReader** × 真包 × 独立实现的地面真值 | CI |
+| gzip 状态机 | 分块重放 vs 一次性解压,逐字节 | 已在本机做过 |
+
+还没做的:`NativeShellExecutor` 里那套 posix_spawn 只能在真机上验。
+
+
 
 

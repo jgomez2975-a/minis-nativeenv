@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 preflight.py 鈥?fail in 20 seconds instead of 35 minutes.
 
@@ -26,9 +26,11 @@ Exit 0 = good to build. Exit 1 = printed reasons.
 from __future__ import annotations
 
 import argparse
+import os
 import plistlib
 import py_compile
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -437,6 +439,49 @@ def check_decode_contract(repo: Path) -> None:
         ok("every modelled key exists; every required field is present")
 
 
+def check_swift_format(repo: Path) -> None:
+    """Apple's own parser (swift-syntax) on every graft source.
+
+    tree-sitter catches gross syntax errors; swift-syntax is the parser Xcode
+    will actually use, so it catches the rest. Only `error:` diagnostics matter
+    here — swift-format also emits style warnings and those are not defects.
+    Ships with Xcode, so CI always has it; absent elsewhere is a skip, not a
+    failure.
+    """
+    print("\n[12] swift-format parse")
+    swift_format = shutil.which("swift-format")
+    if not swift_format:
+        # Local Windows toolchain layout, for running this off-CI.
+        for candidate in Path(os.path.expandvars(
+                r"%LOCALAPPDATA%\Programs\Swift\Toolchains")).glob(
+                "*/usr/bin/swift-format.exe"):
+            swift_format = str(candidate)
+            break
+    if not swift_format:
+        warn("swift-format not found — relying on tree-sitter only")
+        return
+
+    sources = sorted((repo / "src/ios/RuntimeHost").glob("*.swift"))
+    # The host-side harness is compiled by CI too, so it gets the same treatment.
+    sources += sorted((repo / "verify").glob("*.swift"))
+    bad = 0
+    for src in sources:
+        proc = subprocess.run([swift_format, "lint", str(src)],
+                              capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
+        errors = [ln for ln in (proc.stdout + proc.stderr).split("\n")
+                  if ": error:" in ln]
+        if errors:
+            bad += 1
+            fail(f"{src.name}: {len(errors)} parse error(s)")
+            for e in errors[:4]:
+                print("        " + e.strip())
+        else:
+            ok(f"{src.name}")
+    if bad == 0:
+        ok(f"{len(sources)} file(s) parse cleanly under swift-syntax")
+
+
 def check_applogger(repo: Path) -> None:
     print("\n[9] AppLogger surface")
     path = repo / "src/ios/Shared/AppLogger.swift"
@@ -471,6 +516,7 @@ def main() -> int:
     check_applogger(repo)
     check_swift_keywords(repo)
     check_decode_contract(repo)
+    check_swift_format(repo)
 
     print()
     if failures:
